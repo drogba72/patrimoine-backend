@@ -36,7 +36,7 @@ jobs:
       - name: Run update script
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          set -x
-          python update_market_data_pg.py
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: python -m update_market_data_pg
+
 

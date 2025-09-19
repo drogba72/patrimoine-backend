@@ -4,7 +4,7 @@ patrimoine_app_frontend/
 .expo/
 
 # Fichiers sensibles
-.env
+#.env
 
 # Python cache
 __pycache__/
