@@ -36,4 +36,4 @@ jobs:
       - name: Run update script
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python -m update_market_data_pg
+        run: python update_market_data_pg.py
