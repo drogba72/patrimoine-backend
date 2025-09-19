@@ -40,11 +40,16 @@ def fetch_tickers_from_fmp():
     Remplit (isin, ticker, label, market, type, currency, sector).
     """
     api_key = os.environ.get("FMP_API_KEY")
-    if not api_key:
+    
+    # =========================
+    # API key FMP (clé en dur pour test)
+    # =========================
+    FMP_API_KEY = "5SeoYLxathqcoB4pmrq7srp6ayZ0waRk"
+    if not FMP_API_KEY:
         print("⚠️ Pas de clé FMP_API_KEY → skip FMP")
         return []
 
-    url = f"https://financialmodelingprep.com/api/v3/stock/list?apikey={api_key}"
+    url = f"https://financialmodelingprep.com/api/v3/stock/list?apikey={FMP_API_KEY}"
     try:
         r = requests.get(url, timeout=60)
         r.raise_for_status()
