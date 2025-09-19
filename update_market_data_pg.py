@@ -6,13 +6,30 @@ import yfinance as yf
 import pandas as pd
 from sqlalchemy import create_engine, text
 
-DATABASE_URL = os.environ["DATABASE_URL"]  # ex: postgres://user:pass@host:5432/db
-engine = create_engine(DATABASE_URL, future=True)
+print("🚀 Lancement du script update_market_data_pg.py")
+
+# Connexion à la BDD
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("❌ DATABASE_URL n'est pas défini dans les variables d'environnement")
+print("🔑 DATABASE_URL trouvé")
+
+try:
+    engine = create_engine(DATABASE_URL, future=True)
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    print("✅ Connexion BDD OK")
+except Exception as e:
+    print("❌ Erreur connexion BDD :", e)
+    raise
+
 
 def upsert_daily_prices(conn, produit_id, df: pd.DataFrame):
-    # df index = DatetimeIndex, colonnes: Open, High, Low, Close, Volume
     if df is None or df.empty:
+        print(f"⚠️ Aucun prix à insérer pour produit_id={produit_id}")
         return
+
+    print(f"💾 Insertion prix pour produit_id={produit_id}, {len(df)} lignes")
     sql = text("""
         INSERT INTO produits_histo (produit_id, date, open, high, low, close, volume)
         VALUES (:produit_id, :date, :open, :high, :low, :close, :volume)
@@ -37,15 +54,19 @@ def upsert_daily_prices(conn, produit_id, df: pd.DataFrame):
             "volume": int(row.get("Volume")) if pd.notna(row.get("Volume")) else None,
         })
     conn.execute(sql, rows)
+    print(f"✅ Insertion terminée pour produit_id={produit_id}")
+
 
 def compute_and_upsert_indicators(conn, produit_id):
-    # Récupère les dernières 250 clôtures et calcule MA/RSI/MACD
+    print(f"📊 Calcul indicateurs pour produit_id={produit_id}")
     closes = conn.execute(text("""
         SELECT date, close FROM produits_histo
         WHERE produit_id = :pid AND close IS NOT NULL
         ORDER BY date ASC
     """), {"pid": produit_id}).fetchall()
+
     if not closes:
+        print(f"⚠️ Pas de données de clôture pour produit_id={produit_id}")
         return
 
     df = pd.DataFrame(closes, columns=["date","close"]).set_index("date")
@@ -67,7 +88,6 @@ def compute_and_upsert_indicators(conn, produit_id):
     df["macd"] = ema12 - ema26
     df["signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
-    # UPSERT indicateurs pour les dates calculées
     sql = text("""
         INSERT INTO produits_indicateurs (produit_id, date, ma20, ma50, rsi14, macd, signal)
         VALUES (:pid, :date, :ma20, :ma50, :rsi14, :macd, :signal)
@@ -91,30 +111,35 @@ def compute_and_upsert_indicators(conn, produit_id):
             "signal": float(r["signal"]) if pd.notna(r["signal"]) else None,
         })
     conn.execute(sql, payload)
+    print(f"✅ Indicateurs insérés pour produit_id={produit_id}, {len(payload)} lignes")
+
 
 def main():
-    print("⏳ Update market data (PG) ...")
+    print("⏳ Début de la mise à jour des données marché ...")
     with engine.begin() as conn:
         produits = conn.execute(text("""
             SELECT id, ticker_yahoo FROM produits_invest
             WHERE ticker_yahoo IS NOT NULL AND ticker_yahoo <> ''
         """)).fetchall()
 
-        # Récupérer J-10 → aujourd’hui (sécurisant)
+        print(f"📦 {len(produits)} produits trouvés")
+
         end = datetime.utcnow().date()
         start = end - timedelta(days=10)
 
-        for p in produits:
-            pid, ticker = p
+        for pid, ticker in produits:
             try:
-                print(f"↳ {ticker} (id={pid})")
+                print(f"🔎 Téléchargement {ticker} (id={pid}) du {start} au {end}")
                 df = yf.download(ticker, start=start, end=end + timedelta(days=1), interval="1d", auto_adjust=False)
+                print(f"📥 {len(df)} lignes récupérées pour {ticker}")
+
                 upsert_daily_prices(conn, pid, df)
                 compute_and_upsert_indicators(conn, pid)
             except Exception as e:
-                print("❌", ticker, e)
+                print(f"❌ Erreur sur {ticker} (id={pid}):", e)
 
-    print("✅ Terminé", datetime.utcnow().isoformat())
+    print("🏁 Terminé à", datetime.utcnow().isoformat())
+
 
 if __name__ == "__main__":
     main()
