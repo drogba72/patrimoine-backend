@@ -1,0 +1,14 @@
+# Ignore tout ce qui n'est pas backend
+../*
+
+# Mais garde .github si tu veux les workflows
+!.github/
+
+# Fichiers à ignorer
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.log
+.env
+credentials.json
