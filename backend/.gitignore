@@ -1,14 +1,15 @@
-# Ignore tout ce qui n'est pas backend
-../*
+# Ignorer tout ce qui n’est pas backend
+../patrimoine_app_frontend/
+../Autre/
 
-# Mais garde .github si tu veux les workflows
-!.github/
-
-# Fichiers à ignorer
+# Cache / temp
 __pycache__/
 *.pyc
 *.pyo
 *.bak
 *.log
+
+# Secrets
 .env
+*.env
 credentials.json
