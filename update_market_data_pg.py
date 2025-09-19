@@ -1,18 +1,17 @@
-# scripts/update_market_data_pg.py
+# update_market_data_pg.py
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 import yfinance as yf
 import pandas as pd
 from sqlalchemy import create_engine, text
-from bs4 import BeautifulSoup
 
 print("🚀 Lancement du script update_market_data_pg.py")
 
-# -----------------------------
+# =========================
 # Connexion BDD
-# -----------------------------
+# =========================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL n'est pas défini")
@@ -23,20 +22,30 @@ with engine.connect() as conn:
     conn.execute(text("SELECT 1"))
 print("✅ Connexion BDD OK")
 
-# -----------------------------
-# Fonctions utilitaires
-# -----------------------------
+# =========================
+# Sources de tickers
+# =========================
+
+def _clean(s):
+    if s is None:
+        return None
+    s = str(s).strip()
+    return s or None
 
 def fetch_tickers_from_fmp():
-    """Récupère la liste complète des tickers Euronext via FinancialModelingPrep"""
+    """
+    Récupère une large liste de tickers via FinancialModelingPrep.
+    Filtre sur Euronext (toutes places) + Paris.
+    Remplit label, isin, ticker, market, type/currency/sector quand dispo.
+    """
     api_key = os.environ.get("FMP_API_KEY")
     if not api_key:
-        print("⚠️ Pas de clé FMP_API_KEY → skip")
+        print("⚠️ Pas de clé FMP_API_KEY → skip FMP")
         return []
 
     url = f"https://financialmodelingprep.com/api/v3/stock/list?apikey={api_key}"
     try:
-        r = requests.get(url, timeout=30)
+        r = requests.get(url, timeout=60)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
@@ -44,63 +53,132 @@ def fetch_tickers_from_fmp():
         return []
 
     tickers = []
-    for item in data:
-        exch = str(item.get("exchangeShortName", "")).lower()
-        if "paris" in exch or "euronext" in exch:
-            tickers.append({
-                "isin": item.get("isin"),
-                "ticker": item.get("symbol"),
-                "label": item.get("name"),
-                "market": exch.upper()
-            })
-    print(f"📥 {len(tickers)} tickers récupérés via FMP")
-    return tickers
+    for it in data:
+        exch = _clean(it.get("exchangeShortName"))
+        sym  = _clean(it.get("symbol"))
+        name = _clean(it.get("name"))
 
-def fetch_tickers_from_yahoo():
-    """Scrape Yahoo Finance screener France (fallback)"""
-    url = "https://finance.yahoo.com/screener/predefined/most_actives_fr"
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
-        print("❌ Erreur scrap Yahoo:", e)
-        return []
+        # On garde Euronext (AMS/BRU/PAR/LIS/DUB/MIL, etc.) et Paris explicite
+        keep = False
+        if exch:
+            exl = exch.lower()
+            if "euronext" in exl or "paris" in exl or exl in {"epa", "par"}:
+                keep = True
 
-    tickers = []
-    for row in soup.select("table tbody tr"):
-        cols = row.find_all("td")
-        if not cols: 
+        if not keep:
             continue
-        ticker = cols[0].get_text(strip=True)
-        name = cols[1].get_text(strip=True) if len(cols) > 1 else None
+        if not sym:
+            continue
+
+        # Mapping "type" -> nos valeurs {action, etf, fonds}
+        typ = _clean(it.get("type"))  # ex: stock, etf, adr ...
+        if typ:
+            tl = typ.lower()
+            if "etf" in tl:
+                typ_norm = "etf"
+            elif "fund" in tl or "funds" in tl:
+                typ_norm = "fonds"
+            else:
+                typ_norm = "action"
+        else:
+            typ_norm = "action"
+
         tickers.append({
-            "isin": None,
-            "ticker": ticker,
-            "label": name,
-            "market": "Yahoo FR Screener"
+            "isin": _clean(it.get("isin")),
+            "ticker": sym,
+            "label": name or sym,
+            "market": exch or "EURONEXT",
+            "type": typ_norm,
+            "currency": _clean(it.get("currency")),
+            "sector": _clean(it.get("sector")) or _clean(it.get("industry"))  # au mieux
         })
-    print(f"📥 {len(tickers)} tickers récupérés via Yahoo Finance screener")
+
+    # Dédupe par ticker
+    seen = set()
+    dedup = []
+    for t in tickers:
+        if t["ticker"] in seen:
+            continue
+        seen.add(t["ticker"])
+        dedup.append(t)
+
+    print(f"📥 {len(dedup)} tickers récupérés via FMP (après filtre/dédup)")
+    return dedup
+
+def fetch_tickers_fallback():
+    """
+    Fallback simple et fiable (sans scrap JS) pour tester le flux :
+    une liste Euronext Paris connue.
+    """
+    base = [
+        # CAC40 / grosses caps Euronext Paris
+        "AI.PA",   # Air Liquide
+        "OR.PA",   # L'Oréal
+        "MC.PA",   # LVMH
+        "BNP.PA",  # BNP Paribas
+        "DG.PA",   # Vinci
+        "ENGI.PA", # Engie
+        "SAN.PA",  # Sanofi
+        "AIR.PA",  # Airbus
+        "ACA.PA",  # Crédit Agricole
+        "GLE.PA",  # Société Générale
+    ]
+    tickers = [{
+        "isin": None,
+        "ticker": t,
+        "label": t,
+        "market": "EURONEXT PARIS",
+        "type": "action",
+        "currency": "EUR",
+        "sector": None
+    } for t in base]
+    print(f"📥 {len(tickers)} tickers fallback (liste fixe)")
     return tickers
+
+# =========================
+# Upserts
+# =========================
 
 def upsert_produits_invest(conn, tickers):
-    """Insère / met à jour produits_invest"""
+    """
+    Insère / met à jour produits_invest.
+    ⚠️ La table a 'type' NOT NULL → on fournit 'type' (défaut: action).
+    D'autres colonnes sont facultatives.
+    Conflit sur ticker_yahoo (contrainte unique unique_ticker).
+    """
+    if not tickers:
+        return
+
+    # Normalisation + valeurs par défaut
+    for t in tickers:
+        t["isin"]    = _clean(t.get("isin"))
+        t["ticker"]  = _clean(t.get("ticker"))
+        t["label"]   = _clean(t.get("label")) or t["ticker"]
+        t["market"]  = _clean(t.get("market")) or "EURONEXT"
+        t["type"]    = _clean(t.get("type")) or "action"
+        t["currency"]= _clean(t.get("currency"))
+        t["sector"]  = _clean(t.get("sector"))
+
     sql = text("""
-        INSERT INTO produits_invest (isin, ticker_yahoo, label, market)
-        VALUES (:isin, :ticker, :label, :market)
+        INSERT INTO produits_invest (isin, ticker_yahoo, label, market, type, currency, sector)
+        VALUES (:isin, :ticker, :label, :market, :type, :currency, :sector)
         ON CONFLICT (ticker_yahoo)
         DO UPDATE SET
-          isin = EXCLUDED.isin,
-          label = EXCLUDED.label,
-          market = EXCLUDED.market;
+          isin    = EXCLUDED.isin,
+          label   = EXCLUDED.label,
+          market  = EXCLUDED.market,
+          type    = EXCLUDED.type,
+          currency= EXCLUDED.currency,
+          sector  = EXCLUDED.sector;
     """)
     conn.execute(sql, tickers)
-    print(f"✅ {len(tickers)} produits insérés/mis à jour dans produits_invest")
+    print(f"✅ {len(tickers)} produits upsert dans produits_invest")
 
 def upsert_daily_prices(conn, produit_id, df: pd.DataFrame):
     if df is None or df.empty:
         print(f"⚠️ Aucun prix journalier pour produit_id={produit_id}")
         return
+
     sql = text("""
         INSERT INTO produits_histo (produit_id, date, open, high, low, close, volume)
         VALUES (:produit_id, :date, :open, :high, :low, :close, :volume)
@@ -108,44 +186,65 @@ def upsert_daily_prices(conn, produit_id, df: pd.DataFrame):
           open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
           close=EXCLUDED.close, volume=EXCLUDED.volume;
     """)
+
     rows = []
     for idx, row in df.iterrows():
+        d = idx.date() if isinstance(idx, (pd.Timestamp, datetime)) else pd.to_datetime(idx).date()
         rows.append({
             "produit_id": produit_id,
-            "date": idx.date(),
-            "open": float(row["Open"]) if pd.notna(row["Open"]) else None,
-            "high": float(row["High"]) if pd.notna(row["High"]) else None,
-            "low":  float(row["Low"]) if pd.notna(row["Low"]) else None,
-            "close":float(row["Close"]) if pd.notna(row["Close"]) else None,
-            "volume": int(row["Volume"]) if pd.notna(row["Volume"]) else None,
+            "date": d,
+            "open":  float(row.get("Open"))   if pd.notna(row.get("Open"))   else None,
+            "high":  float(row.get("High"))   if pd.notna(row.get("High"))   else None,
+            "low":   float(row.get("Low"))    if pd.notna(row.get("Low"))    else None,
+            "close": float(row.get("Close"))  if pd.notna(row.get("Close"))  else None,
+            "volume":int(row.get("Volume"))   if pd.notna(row.get("Volume")) else None,
         })
-    conn.execute(sql, rows)
-    print(f"💾 produits_histo +{len(rows)} lignes")
+
+    if rows:
+        conn.execute(sql, rows)
+        print(f"💾 produits_histo +{len(rows)} lignes (id={produit_id})")
 
 def upsert_intraday_prices(conn, produit_id, df: pd.DataFrame):
+    """
+    Alimente produits_intraday(produit_id, ts, price, volume).
+    L’index est un DatetimeIndex; on force UTC et on enlève le tzinfo pour TIMESTAMPTZ.
+    """
     if df is None or df.empty:
         print(f"⚠️ Pas de données intraday pour produit_id={produit_id}")
         return
+
+    # Sécurité : s'assurer que l'index est bien en UTC, sans tzinfo
+    idx = df.index
+    if isinstance(idx, pd.DatetimeIndex):
+        if idx.tz is not None:
+            df = df.tz_convert("UTC")
+        else:
+            # on considère que c'est déjà UTC
+            df.index = df.index.tz_localize("UTC")
+    else:
+        df.index = pd.to_datetime(df.index, utc=True)
+
     sql = text("""
-        INSERT INTO produits_intraday (produit_id, datetime, open, high, low, close, volume)
-        VALUES (:pid, :dt, :open, :high, :low, :close, :volume)
-        ON CONFLICT (produit_id, datetime) DO UPDATE SET
-          open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
-          close=EXCLUDED.close, volume=EXCLUDED.volume;
+        INSERT INTO produits_intraday (produit_id, ts, price, volume)
+        VALUES (:pid, :ts, :price, :volume)
+        ON CONFLICT (produit_id, ts) DO UPDATE SET
+          price = EXCLUDED.price,
+          volume = EXCLUDED.volume;
     """)
+
     rows = []
-    for idx, row in df.iterrows():
+    for ts, row in df.iterrows():
+        # ts est timezone-aware UTC → pour TIMESTAMPTZ, on peut passer un datetime aware
         rows.append({
             "pid": produit_id,
-            "dt": idx.to_pydatetime(),
-            "open": float(row["Open"]) if pd.notna(row["Open"]) else None,
-            "high": float(row["High"]) if pd.notna(row["High"]) else None,
-            "low":  float(row["Low"]) if pd.notna(row["Low"]) else None,
-            "close":float(row["Close"]) if pd.notna(row["Close"]) else None,
-            "volume": int(row["Volume"]) if pd.notna(row["Volume"]) else None,
+            "ts": ts.to_pydatetime(),
+            "price": float(row.get("Close"))  if pd.notna(row.get("Close"))  else None,
+            "volume": int(row.get("Volume"))  if pd.notna(row.get("Volume")) else None,
         })
-    conn.execute(sql, rows)
-    print(f"💾 produits_intraday +{len(rows)} lignes")
+
+    if rows:
+        conn.execute(sql, rows)
+        print(f"💾 produits_intraday +{len(rows)} lignes (id={produit_id})")
 
 def compute_and_upsert_indicators(conn, produit_id):
     closes = conn.execute(text("""
@@ -153,18 +252,25 @@ def compute_and_upsert_indicators(conn, produit_id):
         WHERE produit_id=:pid AND close IS NOT NULL
         ORDER BY date ASC
     """), {"pid": produit_id}).fetchall()
-    if not closes: 
+    if not closes:
+        print(f"ℹ️ Pas assez de données pour indicateurs (id={produit_id})")
         return
-    df = pd.DataFrame(closes, columns=["date","close"]).set_index("date")
+
+    df = pd.DataFrame(closes, columns=["date", "close"]).set_index("date")
     df["ma20"] = df["close"].rolling(20).mean()
     df["ma50"] = df["close"].rolling(50).mean()
+
     delta = df["close"].diff()
-    up, down = delta.clip(lower=0), -1*delta.clip(upper=0)
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
     rs = up.rolling(14).mean() / down.rolling(14).mean()
     df["rsi14"] = 100 - (100/(1+rs))
-    ema12, ema26 = df["close"].ewm(span=12, adjust=False).mean(), df["close"].ewm(span=26, adjust=False).mean()
+
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["macd"] = ema12 - ema26
     df["signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+
     sql = text("""
         INSERT INTO produits_indicateurs (produit_id, date, ma20, ma50, rsi14, macd, signal)
         VALUES (:pid, :date, :ma20, :ma50, :rsi14, :macd, :signal)
@@ -172,49 +278,92 @@ def compute_and_upsert_indicators(conn, produit_id):
           ma20=EXCLUDED.ma20, ma50=EXCLUDED.ma50, rsi14=EXCLUDED.rsi14,
           macd=EXCLUDED.macd, signal=EXCLUDED.signal;
     """)
+
     rows = []
     for d, r in df.iterrows():
         rows.append({
-            "pid": produit_id, "date": d,
-            "ma20": float(r["ma20"]) if pd.notna(r["ma20"]) else None,
-            "ma50": float(r["ma50"]) if pd.notna(r["ma50"]) else None,
-            "rsi14": float(r["rsi14"]) if pd.notna(r["rsi14"]) else None,
-            "macd": float(r["macd"]) if pd.notna(r["macd"]) else None,
-            "signal": float(r["signal"]) if pd.notna(r["signal"]) else None,
+            "pid": produit_id,
+            "date": d,
+            "ma20":  float(r["ma20"])   if pd.notna(r["ma20"])   else None,
+            "ma50":  float(r["ma50"])   if pd.notna(r["ma50"])   else None,
+            "rsi14": float(r["rsi14"])  if pd.notna(r["rsi14"])  else None,
+            "macd":  float(r["macd"])   if pd.notna(r["macd"])   else None,
+            "signal":float(r["signal"]) if pd.notna(r["signal"]) else None,
         })
-    conn.execute(sql, rows)
-    print(f"📊 produits_indicateurs +{len(rows)} lignes")
 
-# -----------------------------
+    if rows:
+        conn.execute(sql, rows)
+        print(f"📊 produits_indicateurs +{len(rows)} lignes (id={produit_id})")
+
+# =========================
 # Main
-# -----------------------------
+# =========================
 def main():
     print("⏳ Update market data (PG) ...")
+    max_tickers = int(os.environ.get("MAX_TICKERS", "0") or "0")  # 0 = illimité
+
     with engine.begin() as conn:
-        # Récupérer tickers
+        # 1) Récupération des tickers
         tickers = fetch_tickers_from_fmp()
         if not tickers:
-            tickers = fetch_tickers_from_yahoo()
+            tickers = fetch_tickers_fallback()
         if not tickers:
             print("❌ Aucune source de tickers disponible")
             return
+
+        # Limite éventuelle pour maîtriser les quotas API
+        if max_tickers > 0:
+            tickers = tickers[:max_tickers]
+            print(f"✂️ Limite MAX_TICKERS={max_tickers} → {len(tickers)} gardés")
+
+        # 2) Upsert produits
         upsert_produits_invest(conn, tickers)
 
-        # Récupérer la liste complète depuis produits_invest
-        produits = conn.execute(text("SELECT id, ticker_yahoo FROM produits_invest")).fetchall()
+        # 3) Liste complète des produits à traiter
+        produits = conn.execute(text("""
+            SELECT id, ticker_yahoo FROM produits_invest
+            WHERE ticker_yahoo IS NOT NULL AND ticker_yahoo <> ''
+        """)).fetchall()
         print(f"📊 {len(produits)} produits à traiter")
 
-        end, start = datetime.utcnow().date(), datetime.utcnow().date() - timedelta(days=10)
+        # Fenêtre d'historique (10 jours)
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=10)
+
+        # 4) Boucle de téléchargement
         for pid, ticker in produits:
             try:
                 print(f"↳ {ticker} (id={pid})")
-                df = yf.download(ticker, start=start, end=end+timedelta(days=1), interval="1d")
-                upsert_daily_prices(conn, pid, df)
+
+                # Daily OHLC
+                df_day = yf.download(
+                    ticker,
+                    start=start,
+                    end=end + timedelta(days=1),
+                    interval="1d",
+                    auto_adjust=False,   # pour garder Open/High/Low/Close bruts
+                    progress=False
+                )
+                print(f"   • Daily: {len(df_day)} lignes")
+                upsert_daily_prices(conn, pid, df_day)
+
+                # Indicateurs
                 compute_and_upsert_indicators(conn, pid)
-                df_intra = yf.download(ticker, period="5d", interval="15m")
+
+                # Intraday Close/Volume (5 jours, 15m)
+                df_intra = yf.download(
+                    ticker,
+                    period="5d",
+                    interval="15m",
+                    auto_adjust=False,
+                    progress=False
+                )
+                print(f"   • Intraday: {len(df_intra)} lignes")
                 upsert_intraday_prices(conn, pid, df_intra)
+
             except Exception as e:
                 print(f"❌ Erreur {ticker} :", e)
+
     print("✅ Terminé", datetime.utcnow().isoformat())
 
 if __name__ == "__main__":
