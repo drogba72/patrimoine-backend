@@ -8,3 +8,5 @@ python-dotenv
 flask-bcrypt
 flask-jwt-extended
 pyjwt
+yfinance
+pandas
