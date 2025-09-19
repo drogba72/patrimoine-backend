@@ -23,20 +23,21 @@ with engine.connect() as conn:
 print("✅ Connexion BDD OK")
 
 # =========================
-# Sources de tickers
+# Utilitaires
 # =========================
-
 def _clean(s):
     if s is None:
         return None
     s = str(s).strip()
     return s or None
 
+# =========================
+# Sources de tickers
+# =========================
 def fetch_tickers_from_fmp():
     """
-    Récupère une large liste de tickers via FinancialModelingPrep.
-    Filtre sur Euronext (toutes places) + Paris.
-    Remplit label, isin, ticker, market, type/currency/sector quand dispo.
+    Large liste via FinancialModelingPrep (Euronext & Paris).
+    Remplit (isin, ticker, label, market, type, currency, sector).
     """
     api_key = os.environ.get("FMP_API_KEY")
     if not api_key:
@@ -58,20 +59,15 @@ def fetch_tickers_from_fmp():
         sym  = _clean(it.get("symbol"))
         name = _clean(it.get("name"))
 
-        # On garde Euronext (AMS/BRU/PAR/LIS/DUB/MIL, etc.) et Paris explicite
         keep = False
         if exch:
             exl = exch.lower()
             if "euronext" in exl or "paris" in exl or exl in {"epa", "par"}:
                 keep = True
-
-        if not keep:
-            continue
-        if not sym:
+        if not keep or not sym:
             continue
 
-        # Mapping "type" -> nos valeurs {action, etf, fonds}
-        typ = _clean(it.get("type"))  # ex: stock, etf, adr ...
+        typ = _clean(it.get("type"))
         if typ:
             tl = typ.lower()
             if "etf" in tl:
@@ -90,10 +86,10 @@ def fetch_tickers_from_fmp():
             "market": exch or "EURONEXT",
             "type": typ_norm,
             "currency": _clean(it.get("currency")),
-            "sector": _clean(it.get("sector")) or _clean(it.get("industry"))  # au mieux
+            "sector": _clean(it.get("sector")) or _clean(it.get("industry")),
         })
 
-    # Dédupe par ticker
+    # dédup par ticker
     seen = set()
     dedup = []
     for t in tickers:
@@ -105,23 +101,12 @@ def fetch_tickers_from_fmp():
     print(f"📥 {len(dedup)} tickers récupérés via FMP (après filtre/dédup)")
     return dedup
 
+
 def fetch_tickers_fallback():
-    """
-    Fallback simple et fiable (sans scrap JS) pour tester le flux :
-    une liste Euronext Paris connue.
-    """
+    """Fallback simple : quelques grosses caps Paris."""
     base = [
-        # CAC40 / grosses caps Euronext Paris
-        "AI.PA",   # Air Liquide
-        "OR.PA",   # L'Oréal
-        "MC.PA",   # LVMH
-        "BNP.PA",  # BNP Paribas
-        "DG.PA",   # Vinci
-        "ENGI.PA", # Engie
-        "SAN.PA",  # Sanofi
-        "AIR.PA",  # Airbus
-        "ACA.PA",  # Crédit Agricole
-        "GLE.PA",  # Société Générale
+        "AI.PA","OR.PA","MC.PA","BNP.PA","DG.PA",
+        "ENGI.PA","SAN.PA","AIR.PA","ACA.PA","GLE.PA",
     ]
     tickers = [{
         "isin": None,
@@ -138,45 +123,48 @@ def fetch_tickers_fallback():
 # =========================
 # Upserts
 # =========================
-
 def upsert_produits_invest(conn, tickers):
     """
-    Insère / met à jour produits_invest.
-    ⚠️ La table a 'type' NOT NULL → on fournit 'type' (défaut: action).
-    D'autres colonnes sont facultatives.
-    Conflit sur ticker_yahoo (contrainte unique unique_ticker).
+    Upsert dans produits_invest.
+    Conflit sur UNIQUE(ticker_yahoo).
     """
     if not tickers:
         return
 
-    # Normalisation + valeurs par défaut
     for t in tickers:
-        t["isin"]    = _clean(t.get("isin"))
-        t["ticker"]  = _clean(t.get("ticker"))
-        t["label"]   = _clean(t.get("label")) or t["ticker"]
-        t["market"]  = _clean(t.get("market")) or "EURONEXT"
-        t["type"]    = _clean(t.get("type")) or "action"
-        t["currency"]= _clean(t.get("currency"))
-        t["sector"]  = _clean(t.get("sector"))
+        t["isin"]     = _clean(t.get("isin"))
+        t["ticker"]   = _clean(t.get("ticker"))
+        t["label"]    = _clean(t.get("label")) or t["ticker"]
+        t["market"]   = _clean(t.get("market")) or "EURONEXT"
+        t["type"]     = _clean(t.get("type")) or "action"
+        t["currency"] = _clean(t.get("currency"))
+        t["sector"]   = _clean(t.get("sector"))
 
     sql = text("""
         INSERT INTO produits_invest (isin, ticker_yahoo, label, market, type, currency, sector)
         VALUES (:isin, :ticker, :label, :market, :type, :currency, :sector)
         ON CONFLICT (ticker_yahoo)
         DO UPDATE SET
-          isin    = EXCLUDED.isin,
-          label   = EXCLUDED.label,
-          market  = EXCLUDED.market,
-          type    = EXCLUDED.type,
-          currency= EXCLUDED.currency,
-          sector  = EXCLUDED.sector;
+          isin     = EXCLUDED.isin,
+          label    = EXCLUDED.label,
+          market   = EXCLUDED.market,
+          type     = EXCLUDED.type,
+          currency = EXCLUDED.currency,
+          sector   = EXCLUDED.sector;
     """)
     conn.execute(sql, tickers)
     print(f"✅ {len(tickers)} produits upsert dans produits_invest")
 
+
 def upsert_daily_prices(conn, produit_id, df: pd.DataFrame):
     if df is None or df.empty:
         print(f"⚠️ Aucun prix journalier pour produit_id={produit_id}")
+        return
+
+    # vérif colonnes attendues
+    needed = {"Open","High","Low","Close","Volume"}
+    if not needed.issubset(df.columns):
+        print(f"⚠️ Colonnes manquantes daily (id={produit_id}) -> {set(df.columns)}")
         return
 
     sql = text("""
@@ -189,62 +177,69 @@ def upsert_daily_prices(conn, produit_id, df: pd.DataFrame):
 
     rows = []
     for idx, row in df.iterrows():
-        d = idx.date() if isinstance(idx, (pd.Timestamp, datetime)) else pd.to_datetime(idx).date()
+        try:
+            d = idx.date() if isinstance(idx, (pd.Timestamp, datetime)) else pd.to_datetime(idx).date()
+        except Exception:
+            continue
         rows.append({
             "produit_id": produit_id,
             "date": d,
-            "open":  float(row.get("Open"))   if pd.notna(row.get("Open"))   else None,
-            "high":  float(row.get("High"))   if pd.notna(row.get("High"))   else None,
-            "low":   float(row.get("Low"))    if pd.notna(row.get("Low"))    else None,
-            "close": float(row.get("Close"))  if pd.notna(row.get("Close"))  else None,
-            "volume":int(row.get("Volume"))   if pd.notna(row.get("Volume")) else None,
+            "open":   float(row["Open"])   if pd.notna(row["Open"])   else None,
+            "high":   float(row["High"])   if pd.notna(row["High"])   else None,
+            "low":    float(row["Low"])    if pd.notna(row["Low"])    else None,
+            "close":  float(row["Close"])  if pd.notna(row["Close"])  else None,
+            "volume": int(row["Volume"])   if pd.notna(row["Volume"]) else None,
         })
 
     if rows:
         conn.execute(sql, rows)
         print(f"💾 produits_histo +{len(rows)} lignes (id={produit_id})")
 
+
 def upsert_intraday_prices(conn, produit_id, df: pd.DataFrame):
     """
-    Alimente produits_intraday(produit_id, ts, price, volume).
-    L’index est un DatetimeIndex; on force UTC et on enlève le tzinfo pour TIMESTAMPTZ.
+    Alimente produits_intraday(produit_id, ts, price, volume)
+    à partir de Close/Volume intraday.
     """
     if df is None or df.empty:
         print(f"⚠️ Pas de données intraday pour produit_id={produit_id}")
         return
 
-    # Sécurité : s'assurer que l'index est bien en UTC, sans tzinfo
-    idx = df.index
-    if isinstance(idx, pd.DatetimeIndex):
-        if idx.tz is not None:
-            df = df.tz_convert("UTC")
-        else:
-            # on considère que c'est déjà UTC
-            df.index = df.index.tz_localize("UTC")
-    else:
+    needed = {"Close","Volume"}
+    if not needed.issubset(df.columns):
+        print(f"⚠️ Colonnes manquantes intraday (id={produit_id}) -> {set(df.columns)}")
+        return
+
+    # Normalisation index → UTC aware
+    if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, utc=True)
+    else:
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df = df.tz_convert("UTC")
 
     sql = text("""
         INSERT INTO produits_intraday (produit_id, ts, price, volume)
         VALUES (:pid, :ts, :price, :volume)
         ON CONFLICT (produit_id, ts) DO UPDATE SET
-          price = EXCLUDED.price,
+          price  = EXCLUDED.price,
           volume = EXCLUDED.volume;
     """)
 
     rows = []
     for ts, row in df.iterrows():
-        # ts est timezone-aware UTC → pour TIMESTAMPTZ, on peut passer un datetime aware
         rows.append({
-            "pid": produit_id,
-            "ts": ts.to_pydatetime(),
-            "price": float(row.get("Close"))  if pd.notna(row.get("Close"))  else None,
-            "volume": int(row.get("Volume"))  if pd.notna(row.get("Volume")) else None,
+            "pid":    produit_id,
+            "ts":     ts.to_pydatetime(),  # datetime aware UTC pour TIMESTAMPTZ
+            "price":  float(row["Close"])  if pd.notna(row["Close"])  else None,
+            "volume": int(row["Volume"])   if pd.notna(row["Volume"]) else None,
         })
 
     if rows:
         conn.execute(sql, rows)
         print(f"💾 produits_intraday +{len(rows)} lignes (id={produit_id})")
+
 
 def compute_and_upsert_indicators(conn, produit_id):
     closes = conn.execute(text("""
@@ -252,43 +247,64 @@ def compute_and_upsert_indicators(conn, produit_id):
         WHERE produit_id=:pid AND close IS NOT NULL
         ORDER BY date ASC
     """), {"pid": produit_id}).fetchall()
+
     if not closes:
-        print(f"ℹ️ Pas assez de données pour indicateurs (id={produit_id})")
+        print(f"ℹ️ Pas de clôtures pour indicateurs (id={produit_id})")
         return
 
-    df = pd.DataFrame(closes, columns=["date", "close"]).set_index("date")
-    df["ma20"] = df["close"].rolling(20).mean()
-    df["ma50"] = df["close"].rolling(50).mean()
+    df = pd.DataFrame(closes, columns=["date","close"]).set_index("date")
 
+    # Garde-fous pour éviter toute ambiguité Pandas
+    if df.empty or df["close"].isna().all():
+        print(f"ℹ️ Clôtures vides/NaN (id={produit_id})")
+        return
+
+    # Pour calculer proprement MA50/RSI/MACD, on exige un minimum de points
+    if len(df.index) < 30:  # minimal pour ma20/rsi14 (sinon trop de NaN)
+        print(f"ℹ️ Pas assez de points ({len(df)}) pour indicateurs (id={produit_id})")
+        return
+
+    # MA
+    df["ma20"] = df["close"].rolling(20, min_periods=1).mean()
+    df["ma50"] = df["close"].rolling(50, min_periods=1).mean()
+
+    # RSI(14) simple
     delta = df["close"].diff()
     up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    rs = up.rolling(14).mean() / down.rolling(14).mean()
-    df["rsi14"] = 100 - (100/(1+rs))
+    down = (-delta).clip(lower=0)
+    roll_up = up.rolling(14, min_periods=14).mean()
+    roll_down = down.rolling(14, min_periods=14).mean()
+    rs = roll_up / roll_down
+    df["rsi14"] = 100 - (100 / (1 + rs))
 
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    # MACD 12/26 + signal 9
+    ema12 = df["close"].ewm(span=12, adjust=False, min_periods=12).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False, min_periods=26).mean()
     df["macd"] = ema12 - ema26
-    df["signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["signal"] = df["macd"].ewm(span=9, adjust=False, min_periods=9).mean()
 
+    # Upsert indicateurs
     sql = text("""
         INSERT INTO produits_indicateurs (produit_id, date, ma20, ma50, rsi14, macd, signal)
         VALUES (:pid, :date, :ma20, :ma50, :rsi14, :macd, :signal)
         ON CONFLICT (produit_id, date) DO UPDATE SET
-          ma20=EXCLUDED.ma20, ma50=EXCLUDED.ma50, rsi14=EXCLUDED.rsi14,
-          macd=EXCLUDED.macd, signal=EXCLUDED.signal;
+          ma20   = EXCLUDED.ma20,
+          ma50   = EXCLUDED.ma50,
+          rsi14  = EXCLUDED.rsi14,
+          macd   = EXCLUDED.macd,
+          signal = EXCLUDED.signal;
     """)
 
     rows = []
     for d, r in df.iterrows():
         rows.append({
-            "pid": produit_id,
-            "date": d,
-            "ma20":  float(r["ma20"])   if pd.notna(r["ma20"])   else None,
-            "ma50":  float(r["ma50"])   if pd.notna(r["ma50"])   else None,
-            "rsi14": float(r["rsi14"])  if pd.notna(r["rsi14"])  else None,
-            "macd":  float(r["macd"])   if pd.notna(r["macd"])   else None,
-            "signal":float(r["signal"]) if pd.notna(r["signal"]) else None,
+            "pid":    produit_id,
+            "date":   d,
+            "ma20":   float(r["ma20"])   if pd.notna(r["ma20"])   else None,
+            "ma50":   float(r["ma50"])   if pd.notna(r["ma50"])   else None,
+            "rsi14":  float(r["rsi14"])  if pd.notna(r["rsi14"])  else None,
+            "macd":   float(r["macd"])   if pd.notna(r["macd"])   else None,
+            "signal": float(r["signal"]) if pd.notna(r["signal"]) else None,
         })
 
     if rows:
@@ -303,7 +319,7 @@ def main():
     max_tickers = int(os.environ.get("MAX_TICKERS", "0") or "0")  # 0 = illimité
 
     with engine.begin() as conn:
-        # 1) Récupération des tickers
+        # 1) Récupérer tickers
         tickers = fetch_tickers_from_fmp()
         if not tickers:
             tickers = fetch_tickers_fallback()
@@ -311,7 +327,6 @@ def main():
             print("❌ Aucune source de tickers disponible")
             return
 
-        # Limite éventuelle pour maîtriser les quotas API
         if max_tickers > 0:
             tickers = tickers[:max_tickers]
             print(f"✂️ Limite MAX_TICKERS={max_tickers} → {len(tickers)} gardés")
@@ -319,7 +334,7 @@ def main():
         # 2) Upsert produits
         upsert_produits_invest(conn, tickers)
 
-        # 3) Liste complète des produits à traiter
+        # 3) Produits à traiter
         produits = conn.execute(text("""
             SELECT id, ticker_yahoo FROM produits_invest
             WHERE ticker_yahoo IS NOT NULL AND ticker_yahoo <> ''
@@ -330,7 +345,7 @@ def main():
         end = datetime.now(timezone.utc).date()
         start = end - timedelta(days=10)
 
-        # 4) Boucle de téléchargement
+        # 4) Boucle
         for pid, ticker in produits:
             try:
                 print(f"↳ {ticker} (id={pid})")
@@ -341,13 +356,13 @@ def main():
                     start=start,
                     end=end + timedelta(days=1),
                     interval="1d",
-                    auto_adjust=False,   # pour garder Open/High/Low/Close bruts
-                    progress=False
+                    auto_adjust=False,
+                    progress=False,
                 )
                 print(f"   • Daily: {len(df_day)} lignes")
                 upsert_daily_prices(conn, pid, df_day)
 
-                # Indicateurs
+                # Indicateurs (sur ce qui est en BDD)
                 compute_and_upsert_indicators(conn, pid)
 
                 # Intraday Close/Volume (5 jours, 15m)
@@ -356,7 +371,7 @@ def main():
                     period="5d",
                     interval="15m",
                     auto_adjust=False,
-                    progress=False
+                    progress=False,
                 )
                 print(f"   • Intraday: {len(df_intra)} lignes")
                 upsert_intraday_prices(conn, pid, df_intra)
@@ -365,6 +380,7 @@ def main():
                 print(f"❌ Erreur {ticker} :", e)
 
     print("✅ Terminé", datetime.utcnow().isoformat())
+
 
 if __name__ == "__main__":
     main()

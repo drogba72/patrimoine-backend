@@ -1,42 +1,20 @@
-name: Update Market Data
-
-on:
-  schedule:
-    - cron: "0 2 * * *"   # tous les jours à 2h du matin UTC
-  workflow_dispatch:       # permet de lancer manuellement
-
 jobs:
-  update:
+  update-data:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-
-      - name: List installed packages
-        run: pip list
-
-      - name: Debug files
-        run: |
-          echo "Current dir: $(pwd)"
-          ls -R
-
-      - name: Verify yfinance import
-        run: python -c "import yfinance; print('✅ yfinance import OK, version:', yfinance.__version__)"
+        run: pip install -r requirements.txt
 
       - name: Run update script
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
-        run: python -m update_market_data_pg
-
-
+        run: python update_market_data_pg.py
