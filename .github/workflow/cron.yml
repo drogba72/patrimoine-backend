@@ -1,20 +1,30 @@
+name: Update Market Data
+
+on:
+  workflow_dispatch:   # déclenchement manuel
+  schedule:
+    - cron: "0 20 * * 1-5"   # tous les jours de semaine à 20h UTC
+
 jobs:
-  update-data:
+  update:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run update script
+        run: python update_market_data_pg.py
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
-        run: python update_market_data_pg.py
