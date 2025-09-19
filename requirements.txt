@@ -1,0 +1,12 @@
+gunicorn
+flask
+flask-cors
+sqlalchemy
+requests
+psycopg2-binary
+python-dotenv
+flask-bcrypt
+flask-jwt-extended
+pyjwt
+yfinance
+pandas

@@ -1,0 +1,15 @@
+# Ignorer Expo et frontend
+Autre/
+patrimoine_app_frontend/
+.expo/
+
+# Fichiers sensibles
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
