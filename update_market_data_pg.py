@@ -1,31 +1,28 @@
 import requests
 from bs4 import BeautifulSoup
 
-def test_scrap_justetf(limit=5):
-    url = "https://www.justetf.com/fr/search.html?search=ETFS&sortOrder=asc&sortField=ter"
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
-        print("❌ Erreur scrap JustETF:", e)
-        return
+url = "https://www.justetf.com/fr/search.html?10-1.2-container-tabsContentContainer-tabsContentRepeater-1-container-content-etfsTablePanel&ajaxsortField=ter&ajaxsortOrder=asc"
+headers = {"User-Agent": "Mozilla/5.0"}
 
-    rows = soup.select("table.search-result-table tbody tr")
-    if not rows:
-        print("⚠️ Aucun résultat trouvé (probablement un chargement JS ?)")
-        return
+r = requests.get(url, headers=headers, timeout=30)
+r.raise_for_status()
 
-    print(f"📊 {len(rows)} lignes trouvées dans le tableau")
-    for i, row in enumerate(rows[:limit]):
-        cols = row.find_all("td")
-        if len(cols) < 2:
-            continue
-        name = cols[0].get_text(strip=True)
-        isin = cols[1].get_text(strip=True)
-        url_profile = f"https://www.justetf.com/fr/etf-profile.html?isin={isin}"
+soup = BeautifulSoup(r.text, "html.parser")
 
-        print(f"{i+1}. {name} | ISIN={isin} | Profil={url_profile}")
+# Trouver le tableau
+table = soup.find("table")
+rows = table.find("tbody").find_all("tr")
 
-if __name__ == "__main__":
-    test_scrap_justetf()
+for row in rows[:5]:
+    cols = row.find_all("td")
+    if not cols:
+        continue
+    name = cols[0].get_text(strip=True)
+    isin = None
+
+    # Cherche l’ISIN dans les liens de la ligne
+    link = row.find("a", href=True)
+    if link and "isin=" in link["href"]:
+        isin = link["href"].split("isin=")[-1]
+
+    print(f"Nom: {name} | ISIN: {isin}")
