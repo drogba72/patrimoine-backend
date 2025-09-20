@@ -13,6 +13,9 @@ def main():
     df = overview.load_overview()   # Scraping JustETF
     print(f"✅ {len(df)} ETFs récupérés")
 
+    # Remettre l’index (isin) comme colonne
+    df = df.reset_index()
+
     # Normaliser les colonnes selon ta BDD
     df_final = df[["isin", "ticker", "name", "currency"]].rename(
         columns={
