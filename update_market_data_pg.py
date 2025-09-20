@@ -1,54 +1,38 @@
 import os
-import psycopg2
 import pandas as pd
+from sqlalchemy import create_engine
 from dotenv import load_dotenv
 from justetf_scraping import overview
 
-# Charger variables d'environnement (.env)
-load_dotenv()
-DB_URL = os.getenv("DATABASE_URL")
-
 def main():
     print("[*] Récupération des ETFs depuis JustETF...")
+
+    # 1. Charger la config
+    load_dotenv()
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("❌ DATABASE_URL manquant dans .env")
+
+    # 2. Connexion à la base via SQLAlchemy
+    engine = create_engine(db_url)
+
+    # 3. Récupération des données JustETF
     df = overview.load_overview()
     print(f"✅ {len(df)} ETFs récupérés")
 
-    # On réduit le DataFrame aux colonnes utiles
-    df_simple = df.reset_index()[["isin", "ticker", "name", "currency"]]
+    # 4. Normalisation (on réinitialise l’index pour inclure l’ISIN)
+    df_reset = df.reset_index()
 
-    print("[*] Exemple des 5 premiers :")
-    print(df_simple.head())
+    # Garder un sous-ensemble de colonnes pour la table produits_invest
+    colonnes_cibles = ["isin", "ticker", "name", "currency"]
+    df_final = df_reset[colonnes_cibles]
 
-    # Connexion à PostgreSQL
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
+    print("[*] Exemple des 5 premières lignes :")
+    print(df_final.head())
 
-    # Création de la table si elle n’existe pas déjà
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS produits_invest (
-        isin TEXT PRIMARY KEY,
-        ticker TEXT,
-        name TEXT,
-        currency TEXT
-    )
-    """)
-
-    # Insertion / mise à jour
-    for _, row in df_simple.iterrows():
-        cur.execute("""
-            INSERT INTO produits_invest (isin, ticker, name, currency)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (isin) DO UPDATE
-            SET ticker = EXCLUDED.ticker,
-                name = EXCLUDED.name,
-                currency = EXCLUDED.currency
-        """, (row["isin"], row["ticker"], row["name"], row["currency"]))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    print("✅ Données enregistrées dans produits_invest")
+    # 5. Sauvegarde en BDD
+    df_final.to_sql("produits_invest", engine, if_exists="replace", index=False)
+    print("✅ Données insérées dans la table produits_invest")
 
 if __name__ == "__main__":
     main()
