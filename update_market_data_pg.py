@@ -1,34 +1,34 @@
 import os
 import pandas as pd
 from sqlalchemy import create_engine, text
-from justetf_scraping import overview
 from dotenv import load_dotenv
+from justetf_scraping import overview
 
-# Charger les variables d'environnement (.env)
+# Charger les variables d'environnement
 load_dotenv()
 DB_URL = os.getenv("DATABASE_URL")
 
 def main():
     print("[*] Récupération des ETFs depuis JustETF...")
-    df = overview.load_overview()   # Scraping JustETF
+    df = overview.load_overview()
     print(f"✅ {len(df)} ETFs récupérés")
 
-    # Remettre l’index (isin) comme colonne
-    df = df.reset_index()
-
-    # Normaliser les colonnes selon ta BDD
-    df_final = df[["isin", "ticker", "name", "currency"]].rename(
+    # Normaliser les colonnes pour ta BDD
+    df_final = df.reset_index()[["isin", "ticker", "name", "currency"]].rename(
         columns={
             "ticker": "ticker_yahoo",
-            "name": "label"
+            "name": "label",
         }
     )
-    df_final["type"] = "etf"  # Tous les produits scrapés = ETFs
+    df_final["type"] = "etf"
+
+    # 🔥 FIX : convertir les valeurs manquantes pandas en None (SQL-compatible)
+    df_final = df_final.where(pd.notnull(df_final), None)
 
     print("[*] Exemple des 5 premières lignes :")
     print(df_final.head())
 
-    # Connexion à la base
+    # Connexion SQLAlchemy
     engine = create_engine(DB_URL)
 
     with engine.begin() as conn:
@@ -48,11 +48,9 @@ def main():
                     "ticker_yahoo": row["ticker_yahoo"],
                     "label": row["label"],
                     "currency": row["currency"],
-                    "type": row["type"]
+                    "type": row["type"],
                 }
             )
-
-    print("🎉 Données mises à jour dans produits_invest")
 
 if __name__ == "__main__":
     main()
