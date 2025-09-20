@@ -10,3 +10,5 @@ flask-jwt-extended
 yfinance
 pyjwt
 pandas
+git+https://github.com/druzsan/justetf-scraping.git
+
