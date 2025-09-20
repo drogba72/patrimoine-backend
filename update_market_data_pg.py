@@ -9,19 +9,33 @@ load_dotenv()
 DB_URL = os.getenv("DATABASE_URL")
 
 
-def to_python(val):
+def to_python(val, expected_type=None):
     """
     Convertit proprement les types NumPy/pandas en types Python natifs compatibles PostgreSQL.
+    expected_type: peut forcer un type cible (ex: "date")
     """
-    if pd.isna(val):   # gère NaN et NaT
+    if pd.isna(val):
         return None
+
+    if expected_type == "date":
+        # Si c’est une date pandas
+        if isinstance(val, (pd.Timestamp, )):
+            return val.date()
+        # Si c’est un string de date
+        if isinstance(val, str):
+            try:
+                return pd.to_datetime(val).date()
+            except Exception:
+                return None
+        # Si c’est un nombre → on ignore
+        return None
+
     if isinstance(val, (pd.Timestamp, pd.NaT.__class__)):
         return val.to_pydatetime()
-    if isinstance(val, (pd.Series, pd.DataFrame)):
-        return None
-    if hasattr(val, "item"):  # numpy scalars ont .item()
+    if hasattr(val, "item"):  # numpy scalars
         return val.item()
     return val
+
 
 
 def main():
@@ -136,7 +150,7 @@ def main():
                         "hedged": to_python(meta_row["hedged"]),
                         "securities_lending": to_python(meta_row["securities_lending"]),
                         "distribution_policy": to_python(meta_row["distribution_policy"]),
-                        "last_dividend_date": to_python(meta_row["last_dividend_date"]),
+                        "last_dividend_date": to_python(meta_row["last_dividend_date"], expected_type="date"),
                     }
                 )
 
