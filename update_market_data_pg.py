@@ -1,53 +1,55 @@
 import os
+import pandas as pd
 from sqlalchemy import create_engine, text
-from dotenv import load_dotenv
 from justetf_scraping import overview
+from dotenv import load_dotenv
+
+# Charger les variables d'environnement (.env)
+load_dotenv()
+DB_URL = os.getenv("DATABASE_URL")
 
 def main():
     print("[*] Récupération des ETFs depuis JustETF...")
-
-    # Charger la config
-    load_dotenv()
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError("❌ DATABASE_URL manquant dans .env")
-
-    engine = create_engine(db_url)
-
-    # Récupération JustETF
-    df = overview.load_overview()
+    df = overview.load_overview()   # Scraping JustETF
     print(f"✅ {len(df)} ETFs récupérés")
 
-    df_reset = df.reset_index()
-    colonnes_cibles = ["isin", "ticker", "name", "currency"]
-    df_final = df_reset[colonnes_cibles]
+    # Normaliser les colonnes selon ta BDD
+    df_final = df[["isin", "ticker", "name", "currency"]].rename(
+        columns={
+            "ticker": "ticker_yahoo",
+            "name": "label"
+        }
+    )
+    df_final["type"] = "etf"  # Tous les produits scrapés = ETFs
 
     print("[*] Exemple des 5 premières lignes :")
     print(df_final.head())
 
-    # UPSERT en base
-    insert_sql = """
-        INSERT INTO produits_invest (isin, ticker, name, currency)
-        VALUES (:isin, :ticker, :name, :currency)
-        ON CONFLICT (isin) DO UPDATE SET
-            ticker = EXCLUDED.ticker,
-            name = EXCLUDED.name,
-            currency = EXCLUDED.currency;
-    """
+    # Connexion à la base
+    engine = create_engine(DB_URL)
 
     with engine.begin() as conn:
         for _, row in df_final.iterrows():
             conn.execute(
-                text(insert_sql),
+                text("""
+                    INSERT INTO produits_invest (isin, ticker_yahoo, label, currency, type)
+                    VALUES (:isin, :ticker_yahoo, :label, :currency, :type)
+                    ON CONFLICT (isin) DO UPDATE SET
+                        ticker_yahoo = EXCLUDED.ticker_yahoo,
+                        label = EXCLUDED.label,
+                        currency = EXCLUDED.currency,
+                        type = EXCLUDED.type;
+                """),
                 {
                     "isin": row["isin"],
-                    "ticker": row["ticker"],
-                    "name": row["name"],
+                    "ticker_yahoo": row["ticker_yahoo"],
+                    "label": row["label"],
                     "currency": row["currency"],
-                },
+                    "type": row["type"]
+                }
             )
 
-    print("✅ Données insérées/mises à jour dans produits_invest (UPSERT)")
+    print("🎉 Données mises à jour dans produits_invest")
 
 if __name__ == "__main__":
     main()
