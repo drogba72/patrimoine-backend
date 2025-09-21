@@ -8,8 +8,10 @@ from dotenv import load_dotenv
 from models import (
     Base, User, Beneficiary, Asset, AssetLivret, AssetImmo, AssetPortfolio, PortfolioLine,
     AssetOther, UserIncome, UserExpense, PortfolioProduct, ImmoLoan, ImmoExpense,
-    ProduitInvest, ProduitHisto, ProduitIndicateurs, ProduitIntraday
+    ProduitInvest, ProduitHisto, ProduitIndicateurs, ProduitIntraday,
+    PortfolioTransaction   # ✅ à ajouter
 )
+
 from utils import amortization_monthly_payment
 from datetime import datetime, timedelta
 import traceback
@@ -18,6 +20,7 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 from sqlalchemy.exc import SQLAlchemyError
 import json
 from sqlalchemy import and_
+from scraper_tr import connect as tr_connect_api, validate_2fa as tr_validate_api, fetch_data as tr_fetch_api
 
 
 # Charger variables d’environnement
@@ -1068,6 +1071,250 @@ def get_produit_intraday(pid):
             "price": float(r.price) if r.price is not None else None,
             "volume": int(r.volume) if r.volume is not None else None
         } for r in rows]), 200
+    finally:
+        session.close()
+
+# ---------------------------------------------------------
+# Trade Republic Broker API (mock pour l’instant)
+# ---------------------------------------------------------
+from flask import current_app
+
+@app.route("/api/broker/traderepublic/connect", methods=["POST"])
+@jwt_required()
+def tr_connect():
+    data = request.get_json() or {}
+    phone, pin = data.get("phone"), data.get("pin")
+    if not phone or not pin:
+        return jsonify({"ok": False, "error": "Téléphone et PIN requis"}), 400
+    try:
+        resp = tr_connect_api(phone, pin)
+        return jsonify({"ok": True, "processId": resp["processId"], "countdown": resp["countdownInSeconds"]}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/broker/traderepublic/2fa", methods=["POST"])
+@jwt_required()
+def tr_2fa():
+    data = request.get_json() or {}
+    process_id, code = data.get("processId"), data.get("code")
+    if not process_id or not code:
+        return jsonify({"ok": False, "error": "ProcessId et code requis"}), 400
+    try:
+        token = tr_validate_api(process_id, code)
+        return jsonify({"ok": True, "status": "AUTHENTICATED", "token": token}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/api/broker/traderepublic/portfolio", methods=["GET"])
+@jwt_required()
+def tr_portfolio():
+    token = request.args.get("token")
+    if not token:
+        return jsonify({"ok": False, "error": "Token requis"}), 400
+    try:
+        data = tr_fetch_api(token)
+        return jsonify(data), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+@app.route("/api/broker/traderepublic/import", methods=["POST"])
+@jwt_required()
+def tr_import():
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+
+    cash = parse_float(data.get("cash"))
+    positions = data.get("positions", [])
+    transactions = data.get("transactions", [])
+    allocations = data.get("allocations", [])
+
+    session = Session()
+    try:
+        # Créer l’asset portefeuille global
+        asset = Asset(
+            user_id=user_id,
+            type="portfolio",
+            label="Portefeuille Trade Republic",
+            current_value=cash
+        )
+        session.add(asset)
+        session.flush()
+
+        pf = AssetPortfolio(asset_id=asset.id, broker="Trade Republic")
+        session.add(pf)
+        session.flush()
+
+        # --- 1. Positions -> PortfolioLine
+        for pos in positions:
+            pl = PortfolioLine(
+                portfolio_id=pf.id,
+                isin=pos.get("isin"),
+                label=pos.get("name"),
+                units=parse_float(pos.get("units")),
+                amount_allocated=parse_float(pos.get("avg_price")),  # ⚠️ adapter si format différent
+                allocation_frequency=None,
+                purchase_date=None
+            )
+            session.add(pl)
+
+        # --- 2. Transactions TR -> PortfolioTransaction
+        for tx in transactions:
+            new_tx = PortfolioTransaction(
+                portfolio_id=pf.id,
+                isin=tx.get("isin"),
+                label=tx.get("label") or tx.get("name"),
+                transaction_type=tx.get("transaction_type") or tx.get("type"),
+                quantity=parse_float(tx.get("quantity")),
+                amount=parse_float(tx.get("amount")),
+                date=parse_date(tx.get("date"))
+            )
+            session.add(new_tx)
+
+        session.flush()
+
+        # --- 3. Allocations utilisateur (complète/mets à jour les lignes)
+        for alloc in allocations:
+            line = session.query(PortfolioLine).filter_by(
+                portfolio_id=pf.id, isin=alloc.get("isin")
+            ).first()
+            if line:
+                line.amount_allocated = parse_float(alloc.get("amount_allocated"))
+                line.allocation_frequency = alloc.get("allocation_frequency")
+                line.purchase_date = parse_date(alloc.get("purchase_date"))
+
+        session.commit()
+        return jsonify({"ok": True, "asset_id": asset.id}), 201
+
+    except Exception as e:
+        session.rollback()
+        app.logger.error(f"❌ tr_import error: {e}")
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------
+# Portfolio Transactions
+# ---------------------------------------------------------
+
+@app.route("/api/portfolios/<int:portfolio_id>/transactions", methods=["GET"])
+@jwt_required()
+def list_portfolio_transactions(portfolio_id):
+    user_id = int(get_jwt_identity())
+    session = Session()
+    try:
+        # sécurité : vérifier que le portfolio appartient bien au user
+        pf = (session.query(AssetPortfolio)
+              .join(Asset)
+              .filter(AssetPortfolio.id == portfolio_id, Asset.user_id == user_id)
+              .first())
+        if not pf:
+            return jsonify({"error": "Portfolio introuvable"}), 404
+
+        txs = pf.transactions
+        return jsonify([{
+            "id": tx.id,
+            "isin": tx.isin,
+            "label": tx.label,
+            "transaction_type": tx.transaction_type,
+            "quantity": float(tx.quantity) if tx.quantity else None,
+            "amount": float(tx.amount) if tx.amount else None,
+            "date": tx.date.isoformat()
+        } for tx in txs]), 200
+    finally:
+        session.close()
+
+
+@app.route("/api/portfolios/<int:portfolio_id>/transactions", methods=["POST"])
+@jwt_required()
+def add_portfolio_transaction(portfolio_id):
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+    session = Session()
+    try:
+        pf = (session.query(AssetPortfolio)
+              .join(Asset)
+              .filter(AssetPortfolio.id == portfolio_id, Asset.user_id == user_id)
+              .first())
+        if not pf:
+            return jsonify({"error": "Portfolio introuvable"}), 404
+
+        tx = PortfolioTransaction(
+            portfolio_id=portfolio_id,
+            isin=data.get("isin"),
+            label=data.get("label"),
+            transaction_type=data.get("transaction_type"),
+            quantity=parse_float(data.get("quantity")),
+            amount=parse_float(data.get("amount")),
+            date=parse_date(data.get("date"))
+        )
+        session.add(tx)
+        session.commit()
+        return jsonify({"ok": True, "id": tx.id}), 201
+    except Exception as e:
+        session.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        session.close()
+
+
+@app.route("/api/transactions/<int:tx_id>", methods=["PUT"])
+@jwt_required()
+def update_portfolio_transaction(tx_id):
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+    session = Session()
+    try:
+        tx = (session.query(PortfolioTransaction)
+              .join(AssetPortfolio)
+              .join(Asset)
+              .filter(PortfolioTransaction.id == tx_id, Asset.user_id == user_id)
+              .first())
+        if not tx:
+            return jsonify({"error": "Transaction introuvable"}), 404
+
+        for key in ["isin", "label", "transaction_type"]:
+            if key in data:
+                setattr(tx, key, data[key])
+        if "quantity" in data:
+            tx.quantity = parse_float(data["quantity"])
+        if "amount" in data:
+            tx.amount = parse_float(data["amount"])
+        if "date" in data:
+            tx.date = parse_date(data["date"])
+
+        session.commit()
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        session.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        session.close()
+
+
+@app.route("/api/transactions/<int:tx_id>", methods=["DELETE"])
+@jwt_required()
+def delete_portfolio_transaction(tx_id):
+    user_id = int(get_jwt_identity())
+    session = Session()
+    try:
+        tx = (session.query(PortfolioTransaction)
+              .join(AssetPortfolio)
+              .join(Asset)
+              .filter(PortfolioTransaction.id == tx_id, Asset.user_id == user_id)
+              .first())
+        if not tx:
+            return jsonify({"error": "Transaction introuvable"}), 404
+        session.delete(tx)
+        session.commit()
+        return jsonify({"ok": True, "deleted_id": tx_id}), 200
+    except Exception as e:
+        session.rollback()
+        return jsonify({"error": str(e)}), 500
     finally:
         session.close()
 

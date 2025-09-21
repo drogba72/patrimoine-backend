@@ -173,6 +173,21 @@ class PortfolioLine(Base):
 
     portfolio = relationship("AssetPortfolio", back_populates="lines")
 
+class PortfolioTransaction(Base):
+    __tablename__ = "portfolio_transactions"
+    id = Column(Integer, primary_key=True)
+    portfolio_id = Column(Integer, ForeignKey("assets_portfolio.id", ondelete="CASCADE"), nullable=False)
+    isin = Column(String(50))
+    label = Column(String(255))
+    transaction_type = Column(String(50))  # buy / sell / dividend
+    quantity = Column(Numeric(14,4))
+    amount = Column(Numeric(14,2))
+    date = Column(Date, nullable=False)
+
+    portfolio = relationship("AssetPortfolio", back_populates="transactions")
+
+    AssetPortfolio.transactions = relationship("PortfolioTransaction", back_populates="portfolio", cascade="all, delete-orphan")
+
 
 # ========================
 # Autres actifs
