@@ -22,7 +22,6 @@ import json
 from sqlalchemy import and_
 from scraper_tr import connect as tr_connect_api, validate_2fa as tr_validate_api, fetch_data as tr_fetch_api
 
-
 # Charger variables d’environnement
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
