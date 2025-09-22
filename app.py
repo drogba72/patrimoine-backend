@@ -21,6 +21,18 @@ from sqlalchemy.exc import SQLAlchemyError
 import json
 from sqlalchemy import and_
 from scraper_tr import connect as tr_connect_api, validate_2fa as tr_validate_api, fetch_data as tr_fetch_api
+import logging
+import sys
+
+# Configure root logger
+logging.basicConfig(
+    level=logging.DEBUG,  # ou INFO si tu veux moins verbeux
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)  # affiche sur stdout -> Render
+    ]
+)
+
 
 # Charger variables d’environnement
 load_dotenv()
