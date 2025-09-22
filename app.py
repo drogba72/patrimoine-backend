@@ -1114,32 +1114,17 @@ def tr_portfolio():
     try:
         raw = tr_fetch_api(token)
 
-        # Normalisation des positions
-        accounts = []
-        for acc in raw.get("positions", []):
-            normalized = []
-            for p in acc.get("positions", []):
-                normalized.append({
-                    "isin": p.get("isin"),
-                    "name": p.get("name"),
-                    "units": p.get("units"),
-                    "avgPrice": p.get("avgPrice")
-                })
-            accounts.append({
-                "cashAccountNumber": acc.get("cashAccountNumber"),
-                "securitiesAccountNumber": acc.get("securitiesAccountNumber"),
-                "productType": acc.get("productType"),
-                "positions": normalized
-            })
-
+        # Plus besoin de normaliser : déjà aplati
         return jsonify({
             "cash": raw.get("cash"),
-            "positions": accounts,
+            "positions": raw.get("positions", []),
             "transactions": raw.get("transactions", [])
         }), 200
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
 
 @app.route("/api/broker/traderepublic/import", methods=["POST"])
 @jwt_required()

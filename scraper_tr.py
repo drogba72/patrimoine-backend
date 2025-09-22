@@ -127,10 +127,13 @@ async def fetch_all_transactions(token: str, max_pages=50):
 # =========================================================
 # FETCH PORTFOLIO
 # =========================================================
+# =========================================================
+# FETCH PORTFOLIO
+# =========================================================
 async def fetch_portfolio(token: str):
-    """Récupère cash + comptes + positions via WebSocket."""
+    """Récupère cash + positions aplaties via WebSocket."""
     message_id = 2000
-    portfolio_data = {"cash": None, "accounts": []}
+    portfolio_data = {"cash": None, "positions": []}
 
     async with websockets.connect("wss://api.traderepublic.com") as ws:
         locale_config = {
@@ -160,10 +163,9 @@ async def fetch_portfolio(token: str):
         await safe_recv(ws)
         start, end = resp_accounts.find("{"), resp_accounts.rfind("}")
         accounts = json.loads(resp_accounts[start:end+1]) if start != -1 else {}
-        portfolio_data["accounts"] = accounts.get("accounts", [])
 
-        # --- Positions par compte
-        for acc in portfolio_data["accounts"]:
+        # --- Positions aplaties
+        for acc in accounts.get("accounts", []):
             sec_acc_no = acc.get("securitiesAccountNumber")
             if not sec_acc_no:
                 continue
@@ -175,16 +177,15 @@ async def fetch_portfolio(token: str):
             await safe_recv(ws)
             start, end = resp_positions.find("{"), resp_positions.rfind("}")
             positions = json.loads(resp_positions[start:end+1]) if start != -1 else {}
-            acc["positions"] = []
+
             for cat in positions.get("categories", []):
                 for pos in cat.get("positions", []):
-                    acc["positions"].append({
+                    portfolio_data["positions"].append({
                         "isin": pos.get("instrument", {}).get("isin"),
                         "name": pos.get("instrument", {}).get("title"),
                         "units": pos.get("quantity"),
                         "avgPrice": pos.get("avgPrice", {}).get("value")
                     })
-
 
     return portfolio_data
 
