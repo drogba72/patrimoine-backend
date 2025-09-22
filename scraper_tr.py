@@ -123,10 +123,6 @@ async def fetch_all_transactions(token: str, max_pages=50):
 
     return all_data
 
-
-# =========================================================
-# FETCH PORTFOLIO
-# =========================================================
 # =========================================================
 # FETCH PORTFOLIO
 # =========================================================
@@ -180,12 +176,17 @@ async def fetch_portfolio(token: str):
 
             for cat in positions.get("categories", []):
                 for pos in cat.get("positions", []):
+                    inst = pos.get("instrument") or {}
                     portfolio_data["positions"].append({
-                        "isin": pos.get("instrument", {}).get("isin"),
-                        "name": pos.get("instrument", {}).get("title"),
+                        "isin": inst.get("isin") or pos.get("isin"),
+                        "name": inst.get("title") or inst.get("name"),
                         "units": pos.get("quantity"),
-                        "avgPrice": pos.get("avgPrice", {}).get("value")
+                        "avgPrice": (pos.get("avgPrice") or {}).get("value"),
                     })
+
+            # Debug pour la première position
+            if portfolio_data["positions"]:
+                logger.debug("✅ First parsed position: %s", portfolio_data["positions"][0])
 
 
         # ✅ Logs après récupération

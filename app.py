@@ -1114,22 +1114,39 @@ def tr_portfolio():
     try:
         raw = tr_fetch_api(token)
 
-        # 👇 Add structured logs
-        app.logger.info("TR /portfolio -> cash=%s, positions_len=%s, tx_len=%s",
-                        bool(raw.get("cash")),
-                        len(raw.get("positions") or []),
-                        len(raw.get("transactions") or []))
-        if (raw.get("positions") or []):
-            app.logger.debug("TR /portfolio first_position=%s", (raw["positions"][0]))
+        # Normalisation des positions
+        accounts = []
+        for acc in raw.get("positions", []):
+            normalized = []
+            for p in acc.get("positions", []):
+                normalized.append({
+                    "isin": p.get("isin"),
+                    "name": p.get("name"),
+                    "units": p.get("units"),
+                    "avgPrice": p.get("avgPrice")
+                })
+            accounts.append({
+                "cashAccountNumber": acc.get("cashAccountNumber"),
+                "securitiesAccountNumber": acc.get("securitiesAccountNumber"),
+                "productType": acc.get("productType"),
+                "positions": normalized
+            })
+
+        # ✅ Debug: première position extraite
+        first_position = None
+        if accounts and accounts[0].get("positions"):
+            first_position = accounts[0]["positions"][0]
 
         return jsonify({
             "cash": raw.get("cash"),
-            "positions": raw.get("positions", []),
-            "transactions": raw.get("transactions", [])
+            "positions": accounts,
+            "transactions": raw.get("transactions", []),
+            "debug_first_position": first_position  # <--- ajouté ici
         }), 200
+
     except Exception as e:
-        app.logger.error("❌ /portfolio error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 
