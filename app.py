@@ -1114,15 +1114,23 @@ def tr_portfolio():
     try:
         raw = tr_fetch_api(token)
 
-        # Plus besoin de normaliser : déjà aplati
+        # 👇 Add structured logs
+        app.logger.info("TR /portfolio -> cash=%s, positions_len=%s, tx_len=%s",
+                        bool(raw.get("cash")),
+                        len(raw.get("positions") or []),
+                        len(raw.get("transactions") or []))
+        if (raw.get("positions") or []):
+            app.logger.debug("TR /portfolio first_position=%s", (raw["positions"][0]))
+
         return jsonify({
             "cash": raw.get("cash"),
             "positions": raw.get("positions", []),
             "transactions": raw.get("transactions", [])
         }), 200
-
     except Exception as e:
+        app.logger.error("❌ /portfolio error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 
@@ -1160,11 +1168,12 @@ def tr_import():
                 isin=pos.get("isin"),
                 label=pos.get("name"),
                 units=parse_float(pos.get("units")),
-                amount_allocated=parse_float(pos.get("avg_price")),  # ⚠️ adapter si format différent
+                amount_allocated=parse_float(pos.get("avgPrice")),  # 👈 was avg_price
                 allocation_frequency=None,
                 purchase_date=None
             )
             session.add(pl)
+
 
         # --- 2. Transactions TR -> PortfolioTransaction
         for tx in transactions:

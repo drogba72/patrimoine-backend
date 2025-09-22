@@ -187,7 +187,21 @@ async def fetch_portfolio(token: str):
                         "avgPrice": pos.get("avgPrice", {}).get("value")
                     })
 
+        # ✅ Logs après récupération
+        logger.info(
+            "TR fetch_portfolio: cash=%s positions_len=%s",
+            bool(portfolio_data.get("cash")),
+            len(portfolio_data.get("positions") or [])
+        )
+
+        if portfolio_data.get("positions"):
+            logger.debug(
+                "TR fetch_portfolio first_position=%s",
+                portfolio_data["positions"][0]
+            )
+
     return portfolio_data
+
 
 
 # =========================================================
