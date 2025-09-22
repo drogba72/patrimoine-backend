@@ -1131,15 +1131,15 @@ def tr_portfolio():
         for acc in raw.get("accounts", []):
             normalized = []
             # 🔧 il faut descendre dans categories
-            for cat in acc.get("categories", []):
+            for cat in acc.get("positions", []):  # ici "positions" contient en fait les catégories
                 for p in cat.get("positions", []):
-                    inst = p.get("instrument", {})
                     normalized.append({
-                        "isin": inst.get("isin"),
-                        "name": inst.get("title") or inst.get("name"),
-                        "units": p.get("quantity"),
-                        "avgPrice": (p.get("avgPrice") or {}).get("value"),
+                        "isin": p.get("isin"),
+                        "name": p.get("name"),
+                        "units": p.get("netSize") or p.get("quantity"),
+                        "avgPrice": p.get("averageBuyIn") or (p.get("avgPrice") or {}).get("value"),
                     })
+
 
             accounts.append({
                 "cashAccountNumber": acc.get("cashAccountNumber"),
