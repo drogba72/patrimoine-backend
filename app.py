@@ -1128,21 +1128,26 @@ def tr_portfolio():
 
         # Normalisation des positions
         accounts = []
-        for acc in raw.get("positions", []):
+        for acc in raw.get("accounts", []):
             normalized = []
-            for p in acc.get("positions", []):
-                normalized.append({
-                    "isin": p.get("isin"),
-                    "name": p.get("name"),
-                    "units": p.get("units"),
-                    "avgPrice": p.get("avgPrice")
-                })
+            # 🔧 il faut descendre dans categories
+            for cat in acc.get("categories", []):
+                for p in cat.get("positions", []):
+                    inst = p.get("instrument", {})
+                    normalized.append({
+                        "isin": inst.get("isin"),
+                        "name": inst.get("title") or inst.get("name"),
+                        "units": p.get("quantity"),
+                        "avgPrice": (p.get("avgPrice") or {}).get("value"),
+                    })
+
             accounts.append({
                 "cashAccountNumber": acc.get("cashAccountNumber"),
                 "securitiesAccountNumber": acc.get("securitiesAccountNumber"),
                 "productType": acc.get("productType"),
                 "positions": normalized
             })
+
 
         # ✅ Debug: première position extraite
         first_position = None
