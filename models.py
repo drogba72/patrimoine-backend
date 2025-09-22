@@ -171,7 +171,13 @@ class PortfolioLine(Base):
     allocation_frequency = Column(String(20))  # mensuel / trimestriel / annuel
     purchase_date = Column(Date)
 
+    # ✅ nouveaux champs
+    beneficiary_id = Column(Integer, ForeignKey("beneficiaries.id", ondelete="SET NULL"), nullable=True)
+    date_option = Column(String(10))  # "start" | "mid"
+
     portfolio = relationship("AssetPortfolio", back_populates="lines")
+    beneficiary = relationship("Beneficiary")
+
 
 class PortfolioTransaction(Base):
     __tablename__ = "portfolio_transactions"

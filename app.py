@@ -172,6 +172,8 @@ def serialize_asset(asset: Asset, session) -> dict:
                 "units": float(ln.units) if ln.units is not None else None,
                 "amount_allocated": float(ln.amount_allocated) if ln.amount_allocated is not None else None,
                 "allocation_frequency": ln.allocation_frequency,
+                "date_option": ln.date_option,                 # ✅
+                "beneficiary_id": ln.beneficiary_id,           # ✅
                 "purchase_date": ln.purchase_date.isoformat() if ln.purchase_date else None
             } for ln in pf.lines]
         }
@@ -661,9 +663,12 @@ def add_asset():
                     units=parse_float(ln.get("units")),
                     amount_allocated=parse_float(ln.get("amount_allocated")),
                     allocation_frequency=ln.get("allocation_frequency"),
+                    date_option=ln.get("date_option"),  # ✅
+                    beneficiary_id=parse_int(ln.get("beneficiary_id") or ln.get("beneficiaryId")),  # ✅
                     purchase_date=parse_date(ln.get("purchase_date"))
                 )
                 session.add(pl)
+
 
         # Autres
         elif type_ == "other":
@@ -859,8 +864,11 @@ def update_asset(asset_id):
                         units=parse_float(ln.get("units")),
                         amount_allocated=parse_float(ln.get("amount_allocated")),
                         allocation_frequency=ln.get("allocation_frequency"),
+                        date_option=ln.get("date_option"),  # ✅
+                        beneficiary_id=parse_int(ln.get("beneficiary_id") or ln.get("beneficiaryId")),  # ✅
                         purchase_date=parse_date(ln.get("purchase_date"))
                     ))
+
 
         elif asset.type == "other" and details is not None:
             if not asset.other:
@@ -1225,14 +1233,18 @@ def tr_import():
         session.flush()
 
         # --- 3. Allocations utilisateur (complète/mets à jour les lignes)
+        # --- 3. Allocations utilisateur (complète/mets à jour les lignes)
         for alloc in allocations:
             line = session.query(PortfolioLine).filter_by(
                 portfolio_id=pf.id, isin=alloc.get("isin")
             ).first()
             if line:
-                line.amount_allocated = parse_float(alloc.get("amount_allocated"))
-                line.allocation_frequency = alloc.get("allocation_frequency")
-                line.purchase_date = parse_date(alloc.get("purchase_date"))
+                # mapper les noms venant du front
+                line.amount_allocated = parse_float(alloc.get("amount") or alloc.get("amount_allocated"))
+                line.allocation_frequency = alloc.get("frequency") or alloc.get("allocation_frequency")
+                line.date_option = alloc.get("date_option")  # ✅
+                ben = alloc.get("beneficiary_id") or alloc.get("beneficiaryId")
+                line.beneficiary_id = parse_int(None if ben in (None, "", "self") else ben)  # ✅
 
         session.commit()
         return jsonify({"ok": True, "asset_id": asset.id}), 201
