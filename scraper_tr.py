@@ -175,7 +175,16 @@ async def fetch_portfolio(token: str):
             await safe_recv(ws)
             start, end = resp_positions.find("{"), resp_positions.rfind("}")
             positions = json.loads(resp_positions[start:end+1]) if start != -1 else {}
-            acc["positions"] = positions.get("categories", [])
+            acc["positions"] = []
+            for cat in positions.get("categories", []):
+                for pos in cat.get("positions", []):
+                    acc["positions"].append({
+                        "isin": pos.get("instrument", {}).get("isin"),
+                        "name": pos.get("instrument", {}).get("title"),
+                        "units": pos.get("quantity"),
+                        "avgPrice": pos.get("avgPrice", {}).get("value")
+                    })
+
 
     return portfolio_data
 
