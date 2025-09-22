@@ -16,13 +16,23 @@ logger = logging.getLogger(__name__)
 def connect(phone: str, pin: str) -> dict:
     """Init login → retourne processId et countdown."""
     try:
-        headers = {"Content-Type": "application/json"}
-        r = requests.post(TR_LOGIN_URL, headers=headers, json={"phoneNumber": phone, "pin": pin})
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/118.0.5993.117 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Content-Type": "application/json",
+            "Origin": "https://app.traderepublic.com",
+            "Referer": "https://app.traderepublic.com/",
+        }
+
+        r = requests.post(TR_LOGIN_URL, headers=headers,
+                          json={"phoneNumber": phone, "pin": pin})
         r.raise_for_status()
         data = r.json()
         if "processId" not in data:
             raise RuntimeError("Connexion échouée : vérifiez numéro ou PIN")
-        return data
+        return data  # {processId, countdownInSeconds}
     except Exception as e:
         logger.error(f"❌ TR connect error: {e}")
         raise
@@ -32,7 +42,16 @@ def validate_2fa(process_id: str, code: str) -> str:
     """Valide code 2FA et renvoie un token de session."""
     try:
         url = f"{TR_LOGIN_URL}/{process_id}/{code}"
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/118.0.5993.117 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Content-Type": "application/json",
+            "Origin": "https://app.traderepublic.com",
+            "Referer": "https://app.traderepublic.com/",
+        }
+
         r = requests.post(url, headers=headers)
         r.raise_for_status()
         cookies = r.cookies.get_dict()
@@ -44,6 +63,7 @@ def validate_2fa(process_id: str, code: str) -> str:
         logger.error(f"❌ TR 2FA error: {e}")
         raise
 
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -54,10 +74,12 @@ async def safe_recv(ws, timeout=5):
     except asyncio.TimeoutError:
         return ""
 
+
 # =========================================================
 # FETCH TRANSACTIONS
 # =========================================================
 async def fetch_all_transactions(token: str, max_pages=50):
+    """Récupère l’historique des transactions via WebSocket."""
     all_data = []
     message_id = 0
 
@@ -101,11 +123,12 @@ async def fetch_all_transactions(token: str, max_pages=50):
 
     return all_data
 
+
 # =========================================================
 # FETCH PORTFOLIO
 # =========================================================
 async def fetch_portfolio(token: str):
-    """Récupère cash + comptes + positions."""
+    """Récupère cash + comptes + positions via WebSocket."""
     message_id = 2000
     portfolio_data = {"cash": None, "accounts": []}
 
@@ -156,6 +179,7 @@ async def fetch_portfolio(token: str):
 
     return portfolio_data
 
+
 # =========================================================
 # PUBLIC WRAPPER
 # =========================================================
@@ -171,6 +195,7 @@ def fetch_data(token: str) -> dict:
     except Exception as e:
         logger.error(f"❌ TR fetch_data error: {e}")
         raise
+
 
 async def _fetch_data_async(token: str):
     portfolio = await fetch_portfolio(token)
