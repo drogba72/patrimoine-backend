@@ -127,9 +127,9 @@ async def fetch_all_transactions(token: str, max_pages=50):
 # FETCH PORTFOLIO
 # =========================================================
 async def fetch_portfolio(token: str):
-    """Récupère cash + positions aplaties via WebSocket."""
+    """Récupère cash + comptes titres avec leurs positions (structure TR intacte)."""
     message_id = 2000
-    portfolio_data = {"cash": None, "positions": []}
+    portfolio_data = {"cash": None, "accounts": []}
 
     async with websockets.connect("wss://api.traderepublic.com") as ws:
         locale_config = {
@@ -141,8 +141,9 @@ async def fetch_portfolio(token: str):
         }
         await ws.send(f"connect 31 {json.dumps(locale_config)}")
         await safe_recv(ws)
+        logger.info("✅ WebSocket connectée (portfolio)")
 
-        # --- Solde espèces
+        # --- 1. Solde espèces
         message_id += 1
         await ws.send(f"sub {message_id} " + json.dumps({"type": "availableCash", "token": token}))
         resp_cash = await safe_recv(ws, timeout=10)
@@ -150,8 +151,9 @@ async def fetch_portfolio(token: str):
         await safe_recv(ws)
         start, end = resp_cash.find("{"), resp_cash.rfind("}")
         portfolio_data["cash"] = json.loads(resp_cash[start:end+1]) if start != -1 else {}
+        logger.debug("💰 Cash reçu: %s", portfolio_data["cash"])
 
-        # --- Comptes titres
+        # --- 2. Comptes titres
         message_id += 1
         await ws.send(f"sub {message_id} " + json.dumps({"type": "accountPairs", "token": token}))
         resp_accounts = await safe_recv(ws, timeout=10)
@@ -159,8 +161,9 @@ async def fetch_portfolio(token: str):
         await safe_recv(ws)
         start, end = resp_accounts.find("{"), resp_accounts.rfind("}")
         accounts = json.loads(resp_accounts[start:end+1]) if start != -1 else {}
+        logger.debug("📂 Accounts trouvés: %s", [a.get("securitiesAccountNumber") for a in accounts.get("accounts", [])])
 
-        # --- Positions aplaties
+        # --- 3. Positions par compte
         for acc in accounts.get("accounts", []):
             sec_acc_no = acc.get("securitiesAccountNumber")
             if not sec_acc_no:
@@ -174,48 +177,41 @@ async def fetch_portfolio(token: str):
             start, end = resp_positions.find("{"), resp_positions.rfind("}")
             positions = json.loads(resp_positions[start:end+1]) if start != -1 else {}
 
-            for cat in positions.get("categories", []):
-                for pos in cat.get("positions", []):
-                    inst = pos.get("instrument") or {}
-                    portfolio_data["positions"].append({
-                        "isin": inst.get("isin") or pos.get("isin"),
-                        "name": inst.get("title") or inst.get("name"),
-                        "units": pos.get("quantity"),
-                        "avgPrice": (pos.get("avgPrice") or {}).get("value"),
-                    })
+            acc["positions"] = positions.get("categories", [])
+            portfolio_data["accounts"].append(acc)
 
-            # Debug pour la première position
-            if portfolio_data["positions"]:
-                logger.debug("✅ First parsed position: %s", portfolio_data["positions"][0])
-
-
-        # ✅ Logs après récupération
         logger.info(
-            "TR fetch_portfolio: cash=%s positions_len=%s",
+            "📊 Portfolio récupéré: cash=%s accounts=%s",
             bool(portfolio_data.get("cash")),
-            len(portfolio_data.get("positions") or [])
+            len(portfolio_data.get("accounts"))
         )
 
-        if portfolio_data.get("positions"):
-            logger.debug(
-                "TR fetch_portfolio first_position=%s",
-                portfolio_data["positions"][0]
-            )
+        if portfolio_data["accounts"] and portfolio_data["accounts"][0].get("positions"):
+            logger.debug("✅ Exemple première position brute: %s",
+                         portfolio_data["accounts"][0]["positions"][0])
 
     return portfolio_data
+
 
 
 
 # =========================================================
 # PUBLIC WRAPPER
 # =========================================================
+# =========================================================
+# PUBLIC WRAPPER
+# =========================================================
 def fetch_data(token: str) -> dict:
-    """Récupère cash + positions + transactions pour un utilisateur TR."""
+    """
+    Récupère cash + comptes titres + transactions.
+    Structure TR brute conservée (accounts + categories).
+    L’aplatissement est fait côté app.py.
+    """
     try:
         portfolio, transactions = asyncio.run(_fetch_data_async(token))
         return {
             "cash": portfolio.get("cash"),
-            "positions": portfolio.get("positions", []),  # ✅ corrige ici
+            "accounts": portfolio.get("accounts", []),   # ✅ on garde accounts (pas positions)
             "transactions": transactions or []
         }
     except Exception as e:
@@ -223,8 +219,9 @@ def fetch_data(token: str) -> dict:
         raise
 
 
-
 async def _fetch_data_async(token: str):
+    """Wrapper interne async : récupère portefeuille + transactions."""
     portfolio = await fetch_portfolio(token)
     transactions = await fetch_all_transactions(token)
     return portfolio, transactions
+
