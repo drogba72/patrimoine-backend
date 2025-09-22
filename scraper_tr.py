@@ -199,12 +199,13 @@ def fetch_data(token: str) -> dict:
         portfolio, transactions = asyncio.run(_fetch_data_async(token))
         return {
             "cash": portfolio.get("cash"),
-            "positions": portfolio.get("accounts", []),
+            "positions": portfolio.get("positions", []),  # ✅ corrige ici
             "transactions": transactions or []
         }
     except Exception as e:
         logger.error(f"❌ TR fetch_data error: {e}")
         raise
+
 
 
 async def _fetch_data_async(token: str):
