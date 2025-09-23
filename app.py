@@ -1238,6 +1238,14 @@ def tr_portfolio():
     if not token:
         return jsonify({"ok": False, "error": "Token requis"}), 400
     try:
+        def _num(x):
+        try:
+            if x is None: return None
+            if isinstance(x, (int, float)): return float(x)
+            return float(str(x).replace(",", "."))
+        except Exception:
+            return None
+
         raw = tr_fetch_api(token)
 
         # Normalisation des positions
@@ -1245,13 +1253,13 @@ def tr_portfolio():
         for acc in raw.get("accounts", []):
             normalized = []
             # 🔧 il faut descendre dans categories
-            for cat in acc.get("positions", []):  # ici "positions" contient en fait les catégories
+            for cat in acc.get("positions", []):
                 for p in cat.get("positions", []):
                     normalized.append({
                         "isin": p.get("isin"),
                         "name": p.get("name"),
-                        "units": p.get("netSize") or p.get("quantity"),
-                        "avgPrice": p.get("averageBuyIn") or (p.get("avgPrice") or {}).get("value"),
+                        "units": _num(p.get("netSize") or p.get("quantity") or p.get("virtualSize")),
+                        "avgPrice": _num(p.get("averageBuyIn") or (p.get("avgPrice") or {}).get("value")),
                     })
 
 
