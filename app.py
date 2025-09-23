@@ -121,17 +121,33 @@ def get_or_create_product(session, pf_id, ptype):
     session.add(row); session.flush()
     return row
 
+import re
 
+def map_tr_product_type(s: str) -> str | None:
+    if not s:
+        return None
+    t = s.strip().lower()
 
-def map_tr_product_type(s: str):
-    if not s: return None
-    s = s.lower()
-    if "pea" in s: return "PEA"
-    if "per" in s: return "PER"
-    if "life" in s or "assurance" in s: return "AV"
-    # TR utilise souvent "securities" pour CTO
-    if "securities" in s or "cto" in s: return "CTO"
-    return "CTO"
+    # enums TR fréquents
+    if t in ("default", "securities", "broker"):
+        return "CTO"
+
+    # éviter "wrapPER" -> "PER"
+    if "tax_wrapper" in t:
+        return None  # ambigu: PEA/PER/AV -> à déduire autrement
+
+    # vrais mots seulement
+    if re.search(r"\bpea\b", t):
+        return "PEA"
+    if re.search(r"\bper\b", t):
+        return "PER"
+    if re.search(r"\b(cto|securities)\b", t):
+        return "CTO"
+    if re.search(r"\b(assurance(?:[\s-]?vie)?|life)\b", t):
+        return "AV"
+
+    return None
+
 
 
 def serialize_asset(asset: Asset, session) -> dict:
@@ -601,7 +617,7 @@ def add_asset():
     label = payload["label"]
     current_value = parse_float(payload.get("current_value"))
     details = payload.get("details", {}) or {}
-    beneficiary_id = payload.get("beneficiary_id")
+    beneficiary_id = parse_int(payload.get("beneficiary_id"))
 
     session = Session()
     try:
@@ -803,7 +819,7 @@ def update_asset(asset_id):
         if "current_value" in payload:
             asset.current_value = parse_float(payload["current_value"])
         if "beneficiary_id" in payload:
-            asset.beneficiary_id = payload["beneficiary_id"]
+            asset.beneficiary_id = parse_int(payload["beneficiary_id"])
 
         details = payload.get("details", None)
 
@@ -1250,25 +1266,34 @@ def tr_portfolio():
 
         raw = tr_fetch_api(token)
 
-        accounts = []
+        # 1) Indices par cashAccountNumber
+        hints = {}
+        for tx in raw.get("transactions", []):
+            acc = (tx.get("cashAccountNumber") or "").strip()
+            evt = (tx.get("eventType") or "").lower()
+            sub = (tx.get("subtitle") or "").lower()
+            if acc:
+                if evt.startswith("pea_") or "pea" in sub:
+                    hints[acc] = "PEA"
+                elif evt.startswith("per_") or "retirement" in sub or "per" in sub.split():
+                    hints[acc] = "PER"
+
+        # 2) Lors de la construction des accounts:
         for acc in raw.get("accounts", []):
-            normalized = []
-            # "positions" de niveau compte = catégories → on redescend
-            for cat in acc.get("positions", []):
-                for p in cat.get("positions", []):
-                    normalized.append({
-                        "isin": p.get("isin"),
-                        "name": p.get("name"),
-                        "units": _num(p.get("netSize") or p.get("quantity") or p.get("virtualSize")),
-                        "avgPrice": _num(p.get("averageBuyIn") or (p.get("avgPrice") or {}).get("value")),
-                    })
+            ptype_raw = (acc.get("productType") or "").lower()
+            cash_acc   = (acc.get("cashAccountNumber") or "").strip()
+            inferred = None
+            if "tax_wrapper" in ptype_raw:
+                inferred = hints.get(cash_acc)  # ex: "PEA"
+            normalized = inferred or map_tr_product_type(ptype_raw) or "CTO"
 
             accounts.append({
                 "cashAccountNumber": acc.get("cashAccountNumber"),
                 "securitiesAccountNumber": acc.get("securitiesAccountNumber"),
-                "productType": acc.get("productType"),
-                "positions": normalized
+                "productType": normalized,  # -> "PEA"/"CTO"/...
+                "positions": normalized_positions,
             })
+
 
         first_position = None
         if accounts and accounts[0].get("positions"):
@@ -1307,18 +1332,6 @@ def tr_import():
 
         pf = AssetPortfolio(asset_id=asset.id, broker=broker)
         session.add(pf); session.flush()
-
-        # helper pour upsert un produit (PEA/CTO/AV/PER) côté portfolio
-        def _get_or_create_product(pf_id, ptype):
-            if not ptype:
-                return None
-            row = (session.query(PortfolioProduct)
-                   .filter_by(portfolio_id=pf_id, product_type=ptype)
-                   .first())
-            if row: return row
-            row = PortfolioProduct(portfolio_id=pf_id, product_type=ptype)
-            session.add(row); session.flush()
-            return row
 
         # 1) Positions -> PortfolioLine (PRU ≠ Allocation)
         for pos in positions:
