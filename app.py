@@ -1177,27 +1177,36 @@ from flask import current_app
 def tr_connect():
     uid = int(get_jwt_identity())
     data = request.get_json() or {}
-    phone = data.get("phone")
-    pin   = data.get("pin")
+    phone = (data.get("phone") or "").strip()
+    pin   = (data.get("pin")   or "").strip()
 
     s = Session()
     try:
-        if not phone:
-            link = s.query(BrokerLink).filter_by(user_id=uid, broker="Trade Republic").first()
-            if not link:
-                return jsonify({"ok": False, "error": "No saved phone. Send phone (and pin)"}), 400
+        link = s.query(BrokerLink).filter_by(user_id=uid, broker="Trade Republic").first()
+
+        # ➜ compléter avec ce qui est en base si manquant
+        if (not phone) and link and link.phone_e164:
             phone = link.phone_e164
-            if not pin and link.pin_enc:
-                try:
-                    pin = dec_secret(link.pin_enc)
-                except Exception:
-                    pin = None  # si déchiffrage échoue, on exigera pin côté front
+
+        if (not pin) and link and link.pin_enc:
+            try:
+                pin = dec_secret(link.pin_enc)
+            except Exception:
+                pin = ""
 
         if not phone or not pin:
+            # Petit debug safe (ne log pas le PIN)
+            app.logger.debug("TR /connect missing fields: phone=%s pin_len=%s",
+                             bool(phone), len(pin) if pin else 0)
             return jsonify({"ok": False, "error": "phone and pin required"}), 400
 
         resp = tr_connect_api(phone, pin)
-        return jsonify({"ok": True, "processId": resp["processId"], "countdown": resp["countdownInSeconds"]}), 200
+        return jsonify({
+            "ok": True,
+            "processId": resp["processId"],
+            "countdown": resp["countdownInSeconds"]
+        }), 200
+
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
