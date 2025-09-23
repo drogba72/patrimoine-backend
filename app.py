@@ -1245,96 +1245,64 @@ def tr_2fa():
 
 @app.route("/api/broker/traderepublic/portfolio", methods=["GET","POST"])
 @jwt_required()
-def tr_portfolio():
-    if request.method == "GET":
-        token = request.args.get("token")
-    else:
-        data = request.get_json() or {}
-        token = data.get("token")
+def _flatten_positions(pos_list):
+    flat = []
+    for item in pos_list or []:
+        # groupe TR: pas d'ISIN mais une clé "positions"
+        if isinstance(item, dict) and not item.get("isin") and isinstance(item.get("positions"), list):
+            flat.extend(item["positions"])
+        else:
+            flat.append(item)
+    return flat
 
-    if not token:
-        return jsonify({"ok": False, "error": "Token requis"}), 400
+accounts = []
+for acc in raw.get("accounts", []) or []:
+    cash_acc  = (acc.get("cashAccountNumber") or "").strip()
+    sec_acc   = (acc.get("securitiesAccountNumber") or "").strip()
+    ptype_raw = (acc.get("productType") or "").lower()
 
-    try:
-        def _num(x):
-            try:
-                if x is None:
-                    return None
-                if isinstance(x, (int, float)):
-                    return float(x)
-                return float(str(x).replace(",", "."))
-            except Exception:
-                return None
+    inferred = hints.get(cash_acc) if "tax_wrapper" in ptype_raw else None
+    normalized_type = inferred or map_tr_product_type(ptype_raw) or "CTO"
 
-        raw = tr_fetch_api(token)
-        # raw doit contenir au moins: cash, accounts (avec positions), transactions
+    normalized_positions = []
+    for p in _flatten_positions(acc.get("positions")):
+        # skip tout déchet sans nom/isin
+        if not (p.get("isin") or p.get("name") or p.get("label")):
+            continue
 
-        # ---------- 1) Indices PEA/PER par compte depuis l'historique ----------
-        hints = {}
-        for tx in raw.get("transactions", []) or []:
-            acc = (str(tx.get("cashAccountNumber") or "").strip())
-            evt = (tx.get("eventType") or "").lower()
-            sub = (tx.get("subtitle") or "").lower()
-            if not acc:
-                continue
-            if evt.startswith("pea_") or "pea" in sub:
-                hints[acc] = "PEA"
-            elif evt.startswith("per_") or "retirement" in sub or " per " in f" {sub} ":
-                hints[acc] = "PER"
+        avg = p.get("averageBuyIn")
+        if avg is None and isinstance(p.get("avgPrice"), dict):
+            avg = p["avgPrice"].get("value")
+        elif avg is None:
+            avg = p.get("avgPrice")
 
-        # ---------- 2) Normalisation des comptes + positions ----------
-        accounts = []
-        for acc in raw.get("accounts", []) or []:
-            cash_acc  = (acc.get("cashAccountNumber") or "").strip()
-            sec_acc   = (acc.get("securitiesAccountNumber") or "").strip()
-            ptype_raw = (acc.get("productType") or "").lower()
+        units = p.get("netSize") or p.get("virtualSize") or p.get("quantity") or p.get("units")
 
-            # Certains comptes TR renvoient productType = "tax_wrapper_*"
-            inferred = hints.get(cash_acc) if "tax_wrapper" in ptype_raw else None
-            normalized_type = inferred or map_tr_product_type(ptype_raw) or "CTO"
+        normalized_positions.append({
+            "isin": p.get("isin"),
+            "name": p.get("name") or p.get("label"),
+            "units": _num(units),
+            "avgPrice": _num(avg),
+        })
 
-            # positions dans cet "account"
-            normalized_positions = []
-            for p in acc.get("positions", []) or []:
-                # TR: averageBuyIn / netSize / virtualSize / avgPrice.value...
-                avg = p.get("averageBuyIn")
-                if avg is None and isinstance(p.get("avgPrice"), dict):
-                    avg = p["avgPrice"].get("value")
-                elif avg is None:
-                    avg = p.get("avgPrice")
+    accounts.append({
+        "cashAccountNumber": cash_acc,
+        "securitiesAccountNumber": sec_acc,
+        "productType": normalized_type,   # "PEA"/"CTO"/"PER"/"AV"
+        "positions": normalized_positions,
+    })
 
-                units = p.get("netSize") or p.get("virtualSize") or p.get("quantity") or p.get("units")
+first_position = None
+if accounts and accounts[0]["positions"]:
+    first_position = accounts[0]["positions"][0]
 
-                normalized_positions.append({
-                    "isin": p.get("isin"),
-                    "name": p.get("name") or p.get("label"),
-                    "units": _num(units),
-                    "avgPrice": _num(avg),
-                })
-
-            accounts.append({
-                "cashAccountNumber": cash_acc,
-                "securitiesAccountNumber": sec_acc,
-                "productType": normalized_type,         # "PEA"/"CTO"/"PER"/"AV"
-                "positions": normalized_positions,
-            })
-
-        first_position = None
-        if accounts and accounts[0].get("positions"):
-            first_position = accounts[0]["positions"][0]
-
-        return jsonify({
-            "ok": True,
-            "cash": raw.get("cash"),
-            "positions": accounts,                     # <== le front attend ce shape
-            "transactions": raw.get("transactions", []),
-            "debug_first_position": first_position,
-        }), 200
-
-    except Exception as e:
-        app.logger.exception("❌ /api/broker/traderepublic/portfolio failed")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
+return jsonify({
+    "ok": True,
+    "cash": raw.get("cash"),
+    "positions": accounts,                 # <== idem, mais positions = vraies lignes
+    "transactions": raw.get("transactions", []),
+    "debug_first_position": first_position,
+}), 200
 
 
 @app.route("/api/broker/traderepublic/import", methods=["POST"])
