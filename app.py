@@ -1239,20 +1239,21 @@ def tr_portfolio():
         return jsonify({"ok": False, "error": "Token requis"}), 400
     try:
         def _num(x):
-        try:
-            if x is None: return None
-            if isinstance(x, (int, float)): return float(x)
-            return float(str(x).replace(",", "."))
-        except Exception:
-            return None
+            try:
+                if x is None:
+                    return None
+                if isinstance(x, (int, float)):
+                    return float(x)
+                return float(str(x).replace(",", "."))
+            except Exception:
+                return None
 
         raw = tr_fetch_api(token)
 
-        # Normalisation des positions
         accounts = []
         for acc in raw.get("accounts", []):
             normalized = []
-            # 🔧 il faut descendre dans categories
+            # "positions" de niveau compte = catégories → on redescend
             for cat in acc.get("positions", []):
                 for p in cat.get("positions", []):
                     normalized.append({
@@ -1262,7 +1263,6 @@ def tr_portfolio():
                         "avgPrice": _num(p.get("averageBuyIn") or (p.get("avgPrice") or {}).get("value")),
                     })
 
-
             accounts.append({
                 "cashAccountNumber": acc.get("cashAccountNumber"),
                 "securitiesAccountNumber": acc.get("securitiesAccountNumber"),
@@ -1270,8 +1270,6 @@ def tr_portfolio():
                 "positions": normalized
             })
 
-
-        # ✅ Debug: première position extraite
         first_position = None
         if accounts and accounts[0].get("positions"):
             first_position = accounts[0]["positions"][0]
@@ -1280,14 +1278,11 @@ def tr_portfolio():
             "cash": raw.get("cash"),
             "positions": accounts,
             "transactions": raw.get("transactions", []),
-            "debug_first_position": first_position  # <--- ajouté ici
+            "debug_first_position": first_position
         }), 200
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-
-
-
 
 
 @app.route("/api/broker/traderepublic/import", methods=["POST"])
