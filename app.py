@@ -8,9 +8,10 @@ from dotenv import load_dotenv
 from models import (
     Base, User, Beneficiary, Asset, AssetLivret, AssetImmo, AssetPortfolio, PortfolioLine,
     AssetOther, UserIncome, UserExpense, PortfolioProduct, ImmoLoan, ImmoExpense,
-    ProduitInvest, ProduitHisto, ProduitIndicateurs, ProduitIntraday,
-    PortfolioTransaction   # ✅ à ajouter
+    ProduitInvest, ProduitHisto, ProduitIndicateurs, ProduitIntraday, PortfolioTransaction,
+    BrokerLink,  # ✅ ajout
 )
+
 
 from utils import amortization_monthly_payment
 from datetime import datetime, timedelta
@@ -42,7 +43,8 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL required in env")
 
 # Config DB
-engine = create_engine(DATABASE_URL, echo=False, future=True)
+engine = create_engine(DATABASE_URL, echo=False, future=True, pool_pre_ping=True)  # ✅
+
 Session = sessionmaker(bind=engine)
 
 # App Flask
@@ -70,13 +72,19 @@ jwt = JWTManager(app)
 _key = os.environ.get("BROKER_CRYPT_KEY")
 if not _key:
     raise RuntimeError("BROKER_CRYPT_KEY missing")
-_fernet = Fernet(_key.encode() if not _key.startswith("gAAAA") else _key)
 
-def enc_secret(s: str) -> bytes:
-    return _fernet.encrypt(s.encode())
+# La clé doit être une base64 urlsafe de 32 octets (ex: Fernet.generate_key().decode())
+try:
+    _fernet = Fernet(_key.encode())  # ✅ toujours bytes
+except Exception as e:
+    raise RuntimeError("BROKER_CRYPT_KEY must be a 32-byte urlsafe base64 key") from e
 
-def dec_secret(b: bytes) -> str:
-    return _fernet.decrypt(b).decode()
+def enc_secret(s: str) -> str:
+    return _fernet.encrypt(s.encode()).decode("ascii")   # ✅ str
+
+def dec_secret(token: str) -> str:
+    return _fernet.decrypt(token.encode("ascii")).decode()  # ✅ str in -> str out
+
 
 def parse_float(val):
     try:
@@ -258,7 +266,9 @@ def register():
         session.add(user)
         session.commit()
 
-        token = create_access_token(identity=user.id)
+        # register()
+        token = create_access_token(identity=str(user.id))  # ✅ au lieu de user.id
+
         return jsonify({
             "ok": True,
             "token": token,
@@ -1208,10 +1218,14 @@ def tr_2fa():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/api/broker/traderepublic/portfolio", methods=["GET"])
+@app.route("/api/broker/traderepublic/portfolio", methods=["GET","POST"])
 @jwt_required()
 def tr_portfolio():
-    token = request.args.get("token")
+    if request.method == "GET":
+        token = request.args.get("token")
+    else:
+        data = request.get_json() or {}
+        token = data.get("token")
     if not token:
         return jsonify({"ok": False, "error": "Token requis"}), 400
     try:
@@ -1283,7 +1297,7 @@ def tr_import():
         session.add(pf); session.flush()
 
         # helper pour upsert un produit (PEA/CTO/AV/PER) côté portfolio
-        def get_or_create_product(pf_id, ptype):
+        def _get_or_create_product(pf_id, ptype):
             if not ptype:
                 return None
             row = (session.query(PortfolioProduct)
@@ -1484,8 +1498,9 @@ def tr_link_get():
         masked = link.phone_e164[:-4] + "****" if len(link.phone_e164) > 4 else "****"
         return jsonify({
             "hasLink": True,
-            "phone": link.phone_e164,            # ou masque côté front si tu préfères
-            "remember_pin": bool(link.remember_pin)
+            "phone": link.phone_e164,
+            "remember_pin": bool(link.remember_pin),
+            "hasPin": bool(link.remember_pin),        # ✅ pour compat ascendante côté front
         }), 200
     finally:
         s.close()

@@ -2,8 +2,10 @@
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy import (
-    Column, Integer, String, Numeric, DateTime, ForeignKey, Text, Date, Boolean, BigInteger
+    Column, Integer, String, Numeric, DateTime, ForeignKey, Text, Date, Boolean, BigInteger,
+    UniqueConstraint,   # ✅ AJOUT
 )
+
 from datetime import datetime
 
 
@@ -301,7 +303,7 @@ class BrokerLink(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     broker = Column(String(50), nullable=False)
     phone_e164 = Column(String(32), nullable=False)
-    pin_enc = Column(String, nullable=True)      # ou LargeBinary/BYTEA selon ton dialecte
+    pin_enc = Column(Text, nullable=True)  # ✅ au lieu de String
     remember_pin = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
