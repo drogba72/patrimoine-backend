@@ -23,6 +23,7 @@ from sqlalchemy import and_
 from scraper_tr import connect as tr_connect_api, validate_2fa as tr_validate_api, fetch_data as tr_fetch_api
 import logging
 import sys
+from cryptography.fernet import Fernet, InvalidToken
 
 # Configure root logger
 logging.basicConfig(
@@ -66,6 +67,17 @@ jwt = JWTManager(app)
 # ---------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------
+_key = os.environ.get("BROKER_CRYPT_KEY")
+if not _key:
+    raise RuntimeError("BROKER_CRYPT_KEY missing")
+_fernet = Fernet(_key.encode() if not _key.startswith("gAAAA") else _key)
+
+def enc_secret(s: str) -> bytes:
+    return _fernet.encrypt(s.encode())
+
+def dec_secret(b: bytes) -> str:
+    return _fernet.decrypt(b).decode()
+
 def parse_float(val):
     try:
         return float(val) if val is not None else None
@@ -80,9 +92,39 @@ def parse_int(val):
 
 def parse_date(val):
     try:
-        return datetime.fromisoformat(val).date() if val else None
+        if not val:
+            return None
+        s = str(val).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s).date()
     except Exception:
         return None
+
+def get_or_create_product(session, pf_id, ptype):
+    if not ptype:
+        return None
+    row = (session.query(PortfolioProduct)
+           .filter_by(portfolio_id=pf_id, product_type=ptype)
+           .first())
+    if row:
+        return row
+    row = PortfolioProduct(portfolio_id=pf_id, product_type=ptype)
+    session.add(row); session.flush()
+    return row
+
+
+
+def map_tr_product_type(s: str):
+    if not s: return None
+    s = s.lower()
+    if "pea" in s: return "PEA"
+    if "per" in s: return "PER"
+    if "life" in s or "assurance" in s: return "AV"
+    # TR utilise souvent "securities" pour CTO
+    if "securities" in s or "cto" in s: return "CTO"
+    return "CTO"
+
 
 def serialize_asset(asset: Asset, session) -> dict:
     base = {
@@ -174,7 +216,10 @@ def serialize_asset(asset: Asset, session) -> dict:
                 "allocation_frequency": ln.allocation_frequency,
                 "date_option": ln.date_option,                 # ✅
                 "beneficiary_id": ln.beneficiary_id,           # ✅
-                "purchase_date": ln.purchase_date.isoformat() if ln.purchase_date else None
+                "purchase_date": ln.purchase_date.isoformat() if ln.purchase_date else None,
+                "avg_price": float(ln.avg_price) if ln.avg_price is not None else None,
+                "product_id": ln.product_id,
+                "product_type": ln.product.product_type if ln.product else None
             } for ln in pf.lines]
         }
 
@@ -274,7 +319,7 @@ def me():
 @app.route("/api/users/me/security", methods=["PUT"])
 @jwt_required()
 def update_my_security():
-    user_id = get_jwt_identity()
+    user_id = int(get_jwt_identity())
     payload = request.get_json() or {}
     use_pin = payload.get("use_pin", False)
     use_biometrics = payload.get("use_biometrics", False)
@@ -656,19 +701,29 @@ def add_asset():
 
             # lignes
             for ln in details.get("lines", []) or []:
+                # priorité: product_id explicite > product_type (string) > rien
+                prod = None
+                pid = ln.get("product_id")
+                ptype = ln.get("product_type")
+                if pid:
+                    prod = session.query(PortfolioProduct).filter_by(id=pid, portfolio_id=pf.id).first()
+                elif ptype:
+                    prod = get_or_create_product(session, pf.id, ptype)
+
                 pl = PortfolioLine(
                     portfolio_id=pf.id,
                     isin=ln.get("isin"),
                     label=ln.get("label"),
                     units=parse_float(ln.get("units")),
+                    avg_price=parse_float(ln.get("avg_price")),                 # ✅ PRU
                     amount_allocated=parse_float(ln.get("amount_allocated")),
                     allocation_frequency=ln.get("allocation_frequency"),
-                    date_option=ln.get("date_option"),  # ✅
-                    beneficiary_id=parse_int(ln.get("beneficiary_id") or ln.get("beneficiaryId")),  # ✅
-                    purchase_date=parse_date(ln.get("purchase_date"))
+                    date_option=ln.get("date_option"),
+                    beneficiary_id=parse_int(ln.get("beneficiary_id") or ln.get("beneficiaryId")),
+                    purchase_date=parse_date(ln.get("purchase_date")),
+                    product_id=(prod.id if prod else None)                      # ✅ lien produit
                 )
                 session.add(pl)
-
 
         # Autres
         elif type_ == "other":
@@ -857,18 +912,27 @@ def update_asset(asset_id):
                 for old in list(pf.lines):
                     session.delete(old)
                 for ln in details.get("lines", []):
+                    prod = None
+                    pid = ln.get("product_id")
+                    ptype = ln.get("product_type")
+                    if pid:
+                        prod = session.query(PortfolioProduct).filter_by(id=pid, portfolio_id=pf.id).first()
+                    elif ptype:
+                        prod = get_or_create_product(session, pf.id, ptype)
+
                     session.add(PortfolioLine(
                         portfolio_id=pf.id,
                         isin=ln.get("isin"),
                         label=ln.get("label"),
                         units=parse_float(ln.get("units")),
+                        avg_price=parse_float(ln.get("avg_price")),                 # ✅
                         amount_allocated=parse_float(ln.get("amount_allocated")),
                         allocation_frequency=ln.get("allocation_frequency"),
-                        date_option=ln.get("date_option"),  # ✅
-                        beneficiary_id=parse_int(ln.get("beneficiary_id") or ln.get("beneficiaryId")),  # ✅
-                        purchase_date=parse_date(ln.get("purchase_date"))
+                        date_option=ln.get("date_option"),
+                        beneficiary_id=parse_int(ln.get("beneficiary_id") or ln.get("beneficiaryId")),
+                        purchase_date=parse_date(ln.get("purchase_date")),
+                        product_id=(prod.id if prod else None)                      # ✅
                     ))
-
 
         elif asset.type == "other" and details is not None:
             if not asset.other:
@@ -1101,15 +1165,34 @@ from flask import current_app
 @app.route("/api/broker/traderepublic/connect", methods=["POST"])
 @jwt_required()
 def tr_connect():
+    uid = int(get_jwt_identity())
     data = request.get_json() or {}
-    phone, pin = data.get("phone"), data.get("pin")
-    if not phone or not pin:
-        return jsonify({"ok": False, "error": "Téléphone et PIN requis"}), 400
+    phone = data.get("phone")
+    pin   = data.get("pin")
+
+    s = Session()
     try:
+        if not phone:
+            link = s.query(BrokerLink).filter_by(user_id=uid, broker="Trade Republic").first()
+            if not link:
+                return jsonify({"ok": False, "error": "No saved phone. Send phone (and pin)"}), 400
+            phone = link.phone_e164
+            if not pin and link.pin_enc:
+                try:
+                    pin = dec_secret(link.pin_enc)
+                except Exception:
+                    pin = None  # si déchiffrage échoue, on exigera pin côté front
+
+        if not phone or not pin:
+            return jsonify({"ok": False, "error": "phone and pin required"}), 400
+
         resp = tr_connect_api(phone, pin)
         return jsonify({"ok": True, "processId": resp["processId"], "countdown": resp["countdownInSeconds"]}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        s.close()
+
 
 
 @app.route("/api/broker/traderepublic/2fa", methods=["POST"])
@@ -1186,40 +1269,53 @@ def tr_import():
     positions = data.get("positions", [])
     transactions = data.get("transactions", [])
     allocations = data.get("allocations", [])
+    label = data.get("label") or "Portefeuille Trade Republic"
+    broker = data.get("broker") or "Trade Republic"
+
 
     session = Session()
     try:
-        # Créer l’asset portefeuille global
-        asset = Asset(
-            user_id=user_id,
-            type="portfolio",
-            label="Portefeuille Trade Republic",
-            current_value=cash
-        )
-        session.add(asset)
-        session.flush()
+        # 0) Créer asset + portfolio
+        asset = Asset(user_id=user_id, type="portfolio", label=label, current_value=cash)
+        session.add(asset); session.flush()
 
-        pf = AssetPortfolio(asset_id=asset.id, broker="Trade Republic")
-        session.add(pf)
-        session.flush()
+        pf = AssetPortfolio(asset_id=asset.id, broker=broker)
+        session.add(pf); session.flush()
 
-        # --- 1. Positions -> PortfolioLine
+        # helper pour upsert un produit (PEA/CTO/AV/PER) côté portfolio
+        def get_or_create_product(pf_id, ptype):
+            if not ptype:
+                return None
+            row = (session.query(PortfolioProduct)
+                   .filter_by(portfolio_id=pf_id, product_type=ptype)
+                   .first())
+            if row: return row
+            row = PortfolioProduct(portfolio_id=pf_id, product_type=ptype)
+            session.add(row); session.flush()
+            return row
+
+        # 1) Positions -> PortfolioLine (PRU ≠ Allocation)
         for pos in positions:
+            ptype_raw = pos.get("productType") or pos.get("product_type")
+            ptype = map_tr_product_type(ptype_raw) if ptype_raw else None
+            prod = get_or_create_product(session, pf.id, ptype) if ptype else None
+
             pl = PortfolioLine(
                 portfolio_id=pf.id,
                 isin=pos.get("isin"),
                 label=pos.get("name"),
                 units=parse_float(pos.get("units")),
-                amount_allocated=parse_float(pos.get("avgPrice")),  # 👈 was avg_price
+                avg_price=parse_float(pos.get("avgPrice")),     # ✅ PRU stocké ici
+                amount_allocated=None,                          # ⚠️ pas le PRU !
                 allocation_frequency=None,
-                purchase_date=None
+                purchase_date=None,
+                product_id=prod.id if prod else None            # ✅ typage de la ligne
             )
             session.add(pl)
 
-
-        # --- 2. Transactions TR -> PortfolioTransaction
+        # 2) Transactions TR (inchangé si tu veux)
         for tx in transactions:
-            new_tx = PortfolioTransaction(
+            session.add(PortfolioTransaction(
                 portfolio_id=pf.id,
                 isin=tx.get("isin"),
                 label=tx.get("label") or tx.get("name"),
@@ -1227,24 +1323,21 @@ def tr_import():
                 quantity=parse_float(tx.get("quantity")),
                 amount=parse_float(tx.get("amount")),
                 date=parse_date(tx.get("date"))
-            )
-            session.add(new_tx)
+            ))
 
         session.flush()
 
-        # --- 3. Allocations utilisateur (complète/mets à jour les lignes)
-        # --- 3. Allocations utilisateur (complète/mets à jour les lignes)
+        # 3) Allocations utilisateur -> compléter les lignes existantes
         for alloc in allocations:
-            line = session.query(PortfolioLine).filter_by(
-                portfolio_id=pf.id, isin=alloc.get("isin")
-            ).first()
+            line = (session.query(PortfolioLine)
+                    .filter_by(portfolio_id=pf.id, isin=alloc.get("isin"))
+                    .first())
             if line:
-                # mapper les noms venant du front
-                line.amount_allocated = parse_float(alloc.get("amount") or alloc.get("amount_allocated"))
-                line.allocation_frequency = alloc.get("frequency") or alloc.get("allocation_frequency")
-                line.date_option = alloc.get("date_option")  # ✅
+                line.amount_allocated      = parse_float(alloc.get("amount") or alloc.get("amount_allocated"))
+                line.allocation_frequency  = alloc.get("frequency") or alloc.get("allocation_frequency")
+                line.date_option           = alloc.get("date_option")
                 ben = alloc.get("beneficiary_id") or alloc.get("beneficiaryId")
-                line.beneficiary_id = parse_int(None if ben in (None, "", "self") else ben)  # ✅
+                line.beneficiary_id        = parse_int(None if ben in (None, "", "self") else ben)
 
         session.commit()
         return jsonify({"ok": True, "asset_id": asset.id}), 201
@@ -1252,10 +1345,10 @@ def tr_import():
     except Exception as e:
         session.rollback()
         app.logger.error(f"❌ tr_import error: {e}")
-        traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
         session.close()
+
 
 
 # ---------------------------------------------------------
@@ -1379,6 +1472,72 @@ def delete_portfolio_transaction(tx_id):
     finally:
         session.close()
 
+@app.route("/api/broker/traderepublic/link", methods=["GET"])
+@jwt_required()
+def tr_link_get():
+    uid = int(get_jwt_identity())
+    s = Session()
+    try:
+        link = s.query(BrokerLink).filter_by(user_id=uid, broker="Trade Republic").first()
+        if not link:
+            return jsonify({"hasLink": False}), 200
+        masked = link.phone_e164[:-4] + "****" if len(link.phone_e164) > 4 else "****"
+        return jsonify({
+            "hasLink": True,
+            "phone": link.phone_e164,            # ou masque côté front si tu préfères
+            "remember_pin": bool(link.remember_pin)
+        }), 200
+    finally:
+        s.close()
+
+@app.route("/api/broker/traderepublic/link", methods=["POST"])
+@jwt_required()
+def tr_link_post():
+    uid = int(get_jwt_identity())
+    data = request.get_json() or {}
+    phone = data.get("phone")
+    pin   = data.get("pin")
+    remember = bool(data.get("remember_pin"))
+
+    if not phone:
+        return jsonify({"ok": False, "error": "phone required"}), 400
+
+    s = Session()
+    try:
+        link = s.query(BrokerLink).filter_by(user_id=uid, broker="Trade Republic").first()
+        if not link:
+            link = BrokerLink(user_id=uid, broker="Trade Republic", phone_e164=phone)
+            s.add(link)
+        else:
+            link.phone_e164 = phone
+
+        if remember and pin:
+            link.pin_enc = enc_secret(pin)
+            link.remember_pin = True
+        elif not remember:
+            link.pin_enc = None
+            link.remember_pin = False
+
+        link.updated_at = datetime.utcnow()
+        s.commit()
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        s.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        s.close()
+
+@app.route("/api/broker/traderepublic/link", methods=["DELETE"])
+@jwt_required()
+def tr_link_delete():
+    uid = int(get_jwt_identity())
+    s = Session()
+    try:
+        s.query(BrokerLink).filter_by(user_id=uid, broker="Trade Republic").delete()
+        s.commit()
+        return jsonify({"ok": True}), 200
+    finally:
+        s.close()
 
 
 @app.route("/api/fixtures", methods=["GET"])

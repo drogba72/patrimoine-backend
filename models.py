@@ -149,6 +149,7 @@ class AssetPortfolio(Base):
     asset = relationship("Asset", back_populates="portfolio")
     products = relationship("PortfolioProduct", back_populates="portfolio", cascade="all, delete-orphan")
     lines = relationship("PortfolioLine", back_populates="portfolio", cascade="all, delete-orphan")
+    transactions = relationship("PortfolioTransaction", back_populates="portfolio", cascade="all, delete-orphan")  # ✅ ICI
 
 
 class PortfolioProduct(Base):
@@ -168,15 +169,21 @@ class PortfolioLine(Base):
     label = Column(String(255))
     units = Column(Numeric(14, 4))
     amount_allocated = Column(Numeric(14, 2))
-    allocation_frequency = Column(String(20))  # mensuel / trimestriel / annuel
+    allocation_frequency = Column(String(20))
     purchase_date = Column(Date)
 
-    # ✅ nouveaux champs
+    # ✅ nouveaux / corrigés
+    avg_price = Column(Numeric(14, 4))             # PRU semé depuis TR
+    date_option = Column(String(10))
     beneficiary_id = Column(Integer, ForeignKey("beneficiaries.id", ondelete="SET NULL"), nullable=True)
-    date_option = Column(String(10))  # "start" | "mid"
+
+    # ✅ pour typer la ligne (PEA/CTO/…)
+    product_id = Column(Integer, ForeignKey("portfolio_products.id", ondelete="SET NULL"), nullable=True)
+    product = relationship("PortfolioProduct")
 
     portfolio = relationship("AssetPortfolio", back_populates="lines")
     beneficiary = relationship("Beneficiary")
+
 
 
 class PortfolioTransaction(Base):
@@ -191,9 +198,6 @@ class PortfolioTransaction(Base):
     date = Column(Date, nullable=False)
 
     portfolio = relationship("AssetPortfolio", back_populates="transactions")
-
-    AssetPortfolio.transactions = relationship("PortfolioTransaction", back_populates="portfolio", cascade="all, delete-orphan")
-
 
 # ========================
 # Autres actifs
@@ -237,7 +241,7 @@ class UserExpense(Base):
 class ProduitInvest(Base):
     __tablename__ = "produits_invest"
     id = Column(Integer, primary_key=True)
-    isin = Column(String(20), unique=True, nullable=False)
+    isin = Column(String(20), unique=True, nullable=True)
     ticker_yahoo = Column(String(50))
     label = Column(String(255), nullable=False)
     type = Column(String(50), nullable=False)   # action / etf / fonds
@@ -289,3 +293,17 @@ class ProduitIndicateurs(Base):
     signal = Column(Numeric(14, 4))
 
     produit = relationship("ProduitInvest", back_populates="indicateurs")
+
+
+class BrokerLink(Base):
+    __tablename__ = "broker_links"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    broker = Column(String(50), nullable=False)
+    phone_e164 = Column(String(32), nullable=False)
+    pin_enc = Column(String, nullable=True)      # ou LargeBinary/BYTEA selon ton dialecte
+    remember_pin = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint('user_id', 'broker', name='uq_user_broker'),)
