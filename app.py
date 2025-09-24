@@ -20,7 +20,7 @@ from flask_bcrypt import Bcrypt
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from sqlalchemy.exc import SQLAlchemyError
 import json
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 from scraper_tr import connect as tr_connect_api, validate_2fa as tr_validate_api, fetch_data as tr_fetch_api
 import logging
 import sys
@@ -239,6 +239,23 @@ def serialize_asset(asset: Asset, session) -> dict:
             "recurring_frequency": lv.recurring_frequency,
             "recurring_day": lv.recurring_day
         }
+
+        # ⚖️ Ajustement par les événements 'posted' jusqu'à aujourd'hui
+        try:
+           today = datetime.utcnow().date()
+           delta = (session.query(func.coalesce(func.sum(AssetEvent.amount), 0.0))
+                    .filter(
+                        AssetEvent.user_id == asset.user_id,
+                        AssetEvent.asset_id == asset.id,
+                        AssetEvent.status == "posted",
+                        AssetEvent.kind.in_(["cash_op", "transfer"]),
+                        AssetEvent.value_date <= today
+                    ).scalar() or 0.0)
+           effective = (lv.balance or 0.0) + float(delta)
+           base["details"]["balance_effective"] = float(effective)
+        except Exception:
+            # en cas de pépin, on n’empêche pas la réponse
+            base["details"]["balance_effective"] = base["details"]["balance"]
 
     elif asset.type == "immo" and asset.immo:
         im = asset.immo
