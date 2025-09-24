@@ -3,7 +3,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy import (
     Column, Integer, String, Numeric, DateTime, ForeignKey, Text, Date, Boolean, BigInteger,
-    UniqueConstraint,   # ✅ AJOUT
+    UniqueConstraint, Enum, Index  # ✅ AJOUT
 )
 
 from datetime import datetime
@@ -296,7 +296,6 @@ class ProduitIndicateurs(Base):
 
     produit = relationship("ProduitInvest", back_populates="indicateurs")
 
-
 class BrokerLink(Base):
     __tablename__ = "broker_links"
     id = Column(Integer, primary_key=True)
@@ -309,3 +308,60 @@ class BrokerLink(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (UniqueConstraint('user_id', 'broker', name='uq_user_broker'),)
+
+class AssetEvent(Base):
+    __tablename__ = "asset_events"
+
+    id = Column(Integer, primary_key=True)
+
+    user_id  = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    asset_id = Column(Integer, ForeignKey("assets.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    kind = Column(Enum(
+        "cash_op", "transfer", "portfolio_trade", "dividend",
+        "allocation_change", "loan_prepayment", "rent_change",
+        "expense_change", "valuation_adjustment", "other",
+        name="event_kind"
+    ), nullable=False)
+
+    status = Column(Enum("planned","posted","cancelled", name="event_status"),
+                    nullable=False, default="posted")
+
+    value_date = Column(Date, nullable=False)
+    rrule      = Column(String)     # ex: "FREQ=MONTHLY;BYMONTHDAY=1"
+    end_date   = Column(Date)
+
+    # Montants / quantités (facultatifs selon kind)
+    amount     = Column(Numeric(14, 2))   # cash ±
+    quantity   = Column(Numeric(20, 6))   # trades
+    unit_price = Column(Numeric(14, 4))
+
+    # Ciblage portefeuille
+    isin               = Column(String(12), index=True)
+    portfolio_line_id  = Column(Integer, ForeignKey("portfolio_lines.id"))
+
+    # Transferts
+    target_asset_id    = Column(Integer, ForeignKey("assets.id"))
+    transfer_group_id  = Column(String(36), index=True)  # UUID string
+
+    # Métadonnées
+    category = Column(String(50))   # depot/retrait/frais/interets...
+    note     = Column(Text)
+    data     = Column(JSONB, default=dict)  # champs libres
+
+    # Traçabilité côté "écritures spécialisées" (ex: PortfolioTransaction)
+    posted_entity_type = Column(String(50))
+    posted_entity_id   = Column(Integer)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # Relations utiles
+    asset         = relationship("Asset", foreign_keys=[asset_id])
+    target_asset  = relationship("Asset", foreign_keys=[target_asset_id])
+    portfolio_line = relationship("PortfolioLine")
+
+    __table_args__ = (
+        Index("ix_asset_events_user_asset_date", "user_id", "asset_id", "value_date"),
+        Index("ix_asset_events_status_kind", "status", "kind"),
+    )

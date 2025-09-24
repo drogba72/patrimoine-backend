@@ -9,7 +9,7 @@ from models import (
     Base, User, Beneficiary, Asset, AssetLivret, AssetImmo, AssetPortfolio, PortfolioLine,
     AssetOther, UserIncome, UserExpense, PortfolioProduct, ImmoLoan, ImmoExpense,
     ProduitInvest, ProduitHisto, ProduitIndicateurs, ProduitIntraday, PortfolioTransaction,
-    BrokerLink,  # ✅ ajout
+    BrokerLink, AssetEvent, # ✅ ajout
 )
 
 
@@ -98,6 +98,17 @@ def parse_int(val):
     except Exception:
         return None
 
+import uuid
+
+def ensure_user_asset(session, user_id: int, asset_id: int):
+    return session.query(Asset).filter_by(id=asset_id, user_id=user_id).first()
+
+def ensure_isin_known(session, isin: str) -> bool:
+    if not isin:
+        return True
+    return session.query(ProduitInvest).filter(ProduitInvest.isin == isin).first() is not None
+
+
 def parse_date(val):
     try:
         if not val:
@@ -147,6 +158,63 @@ def map_tr_product_type(s: str) -> str | None:
         return "AV"
 
     return None
+
+def upsert_produits_from_positions(session, positions):
+    """
+    S'assure que chaque position (par ISIN) existe dans ProduitInvest.
+    Crée les manquants avec les infos minimales disponibles.
+    Retourne un récapitulatif {existing: [...], created: [...] }.
+    """
+    if not positions:
+        return {"existing": [], "created": []}
+
+    # 1) Collecte des métadonnées par ISIN
+    meta_by_isin = {}
+    for pos in positions:
+        isin = (pos.get("isin") or "").strip().upper()
+        if not isin:
+            continue  # on ignore les lignes sans ISIN
+        name = pos.get("name") or pos.get("label")
+        ptype_raw = pos.get("productType") or pos.get("product_type")
+        ptype = map_tr_product_type(ptype_raw) if ptype_raw else None
+
+        d = meta_by_isin.setdefault(isin, {"labels": set(), "eligible": set()})
+        if name:
+            d["labels"].add(name)
+        if ptype:
+            d["eligible"].add(ptype)
+
+    if not meta_by_isin:
+        return {"existing": [], "created": []}
+
+    # 2) Recherche des ISIN déjà présents
+    existing_rows = (session.query(ProduitInvest.isin)
+                     .filter(ProduitInvest.isin.in_(list(meta_by_isin.keys())))
+                     .all())
+    existing_isins = {r.isin for r in existing_rows}
+
+    # 3) Création des manquants
+    created = []
+    for isin, meta in meta_by_isin.items():
+        if isin in existing_isins:
+            continue
+        label = next(iter(meta["labels"]), isin)  # fallback = ISIN comme label
+        eligible_in = sorted(list(meta["eligible"]))  # ex: ["PEA"] ou []
+        p = ProduitInvest(
+            isin=isin,
+            label=label,
+            type=None,                  # inconnu à ce stade
+            eligible_in=eligible_in,    # JSONB
+            currency=None,
+            market=None,
+            sector=None,
+            ticker_yahoo=None
+        )
+        session.add(p)
+        session.flush()  # pour récupérer p.id si besoin
+        created.append({"id": p.id, "isin": p.isin, "label": p.label})
+
+    return {"existing": list(existing_isins), "created": created}
 
 
 
@@ -1376,6 +1444,16 @@ def tr_import():
         pf = AssetPortfolio(asset_id=asset.id, broker=broker)
         session.add(pf); session.flush()
 
+        # 0.b) Vérifier/compléter produits_invest par ISIN
+        try:
+            products_sync = upsert_produits_from_positions(session, positions)
+            app.logger.info("produits_invest sync: created=%d existing=%d",
+                            len(products_sync.get("created", [])),
+                            len(products_sync.get("existing", [])))
+        except Exception as _e:
+            app.logger.warning("produits_invest sync failed: %s", _e)
+            products_sync = {"created": [], "existing": []}
+
         # 1) Positions -> PortfolioLine (PRU ≠ Allocation)
         for pos in positions:
             ptype_raw = pos.get("productType") or pos.get("product_type")
@@ -1624,10 +1702,298 @@ def tr_link_delete():
     finally:
         s.close()
 
-
 @app.route("/api/fixtures", methods=["GET"])
 def fixtures():
     return jsonify({"ok": True, "now": datetime.utcnow().isoformat()})
+
+# ---------------------------------------------------------
+# Asset Events (grand livre des impondérables)
+# ---------------------------------------------------------
+
+@app.route("/api/events", methods=["POST"])
+@jwt_required()
+def create_event():
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+
+    kind = data.get("kind")
+    if not kind:
+        return jsonify({"ok": False, "error": "kind required"}), 400
+
+    status = data.get("status") or "posted"
+    value_date = parse_date(data.get("value_date"))
+    if not value_date:
+        return jsonify({"ok": False, "error": "value_date (YYYY-MM-DD) required"}), 400
+
+    rrule = data.get("rrule")
+    end_date = parse_date(data.get("end_date"))
+    note = data.get("note")
+    category = data.get("category")
+    extra = data.get("data") or {}
+
+    session = Session()
+    try:
+        # ---- TRANSFER (crée 2 events) ----
+        if kind == "transfer":
+            amount = parse_float(data.get("amount"))
+            if amount is None or amount <= 0:
+                return jsonify({"ok": False, "error": "amount > 0 required for transfer"}), 400
+
+            src_id = data.get("source_asset_id") or data.get("asset_id")
+            dst_id = data.get("target_asset_id")
+            if not src_id or not dst_id:
+                return jsonify({"ok": False, "error": "source_asset_id and target_asset_id required"}), 400
+            if src_id == dst_id:
+                return jsonify({"ok": False, "error": "source and target must differ"}), 400
+
+            src = ensure_user_asset(session, user_id, int(src_id))
+            dst = ensure_user_asset(session, user_id, int(dst_id))
+            if not src or not dst:
+                return jsonify({"ok": False, "error": "asset(s) not found or not owned"}), 404
+
+            group_id = str(uuid.uuid4())
+
+            debit = AssetEvent(
+                user_id=user_id, asset_id=src.id, target_asset_id=dst.id,
+                kind="transfer", status=status, value_date=value_date,
+                rrule=rrule, end_date=end_date,
+                amount=-abs(amount), category=category, note=note,
+                transfer_group_id=group_id, data=extra
+            )
+            credit = AssetEvent(
+                user_id=user_id, asset_id=dst.id, target_asset_id=src.id,
+                kind="transfer", status=status, value_date=value_date,
+                rrule=rrule, end_date=end_date,
+                amount=abs(amount), category=category, note=note,
+                transfer_group_id=group_id, data=extra
+            )
+            session.add_all([debit, credit])
+            session.commit()
+            return jsonify({"ok": True, "ids": [debit.id, credit.id], "transfer_group_id": group_id}), 201
+
+        # ---- AUTRES KINDS ----
+        asset_id = data.get("asset_id")
+        if not asset_id:
+            return jsonify({"ok": False, "error": "asset_id required"}), 400
+
+        asset = ensure_user_asset(session, user_id, int(asset_id))
+        if not asset:
+            return jsonify({"ok": False, "error": "asset not found or not owned"}), 404
+
+        amount     = parse_float(data.get("amount"))
+        quantity   = parse_float(data.get("quantity"))
+        unit_price = parse_float(data.get("unit_price"))
+        isin       = (data.get("isin") or "").strip().upper() or None
+
+        # Validation ISIN pour trades/dividendes
+        if kind in ("portfolio_trade", "dividend") and not ensure_isin_known(session, isin):
+            return jsonify({"ok": False, "error": "ISIN inconnu dans produits_invest"}), 400
+
+        ev = AssetEvent(
+            user_id=user_id, asset_id=asset.id,
+            kind=kind, status=status, value_date=value_date,
+            rrule=rrule, end_date=end_date,
+            amount=amount, quantity=quantity, unit_price=unit_price,
+            isin=isin, category=category, note=note, data=extra
+        )
+
+        # Lier à une ligne portefeuille si possible
+        if isin and asset.type == "portfolio":
+            line = (session.query(PortfolioLine)
+                    .join(AssetPortfolio, PortfolioLine.portfolio_id == AssetPortfolio.id)
+                    .filter(AssetPortfolio.asset_id == asset.id, PortfolioLine.isin == isin)
+                    .first())
+            if line:
+                ev.portfolio_line_id = line.id
+
+        session.add(ev)
+        session.flush()
+
+        # Effets côté portefeuille (facultatif, utile si status=posted)
+        if status == "posted" and asset.type == "portfolio" and kind in ("portfolio_trade", "dividend"):
+            pf = session.query(AssetPortfolio).filter_by(asset_id=asset.id).first()
+            if pf:
+                if kind == "portfolio_trade":
+                    tx_type = "buy" if (quantity or 0) > 0 else "sell"
+                else:
+                    tx_type = "dividend"
+                tx = PortfolioTransaction(
+                    portfolio_id=pf.id,
+                    isin=isin,
+                    label=data.get("label") or note,
+                    transaction_type=tx_type,
+                    quantity=quantity if kind == "portfolio_trade" else None,
+                    amount=amount,
+                    date=value_date
+                )
+                session.add(tx); session.flush()
+                ev.posted_entity_type = "portfolio_transaction"
+                ev.posted_entity_id   = tx.id
+
+        session.commit()
+        return jsonify({"ok": True, "id": ev.id}), 201
+
+    except Exception as e:
+        session.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        session.close()
+
+
+@app.route("/api/events", methods=["GET"])
+@jwt_required()
+def list_events():
+    user_id = int(get_jwt_identity())
+    asset_id = request.args.get("asset_id", type=int)
+    kind = request.args.get("kind")
+    status = request.args.get("status")
+    isin = request.args.get("isin")
+    dfrom = request.args.get("from")
+    dto   = request.args.get("to")
+    limit = request.args.get("limit", type=int) or 200
+    offset= request.args.get("offset", type=int) or 0
+
+    session = Session()
+    try:
+        q = session.query(AssetEvent).filter(AssetEvent.user_id == user_id)
+        if asset_id:
+            q = q.filter(AssetEvent.asset_id == asset_id)
+        if kind:
+            q = q.filter(AssetEvent.kind == kind)
+        if status:
+            q = q.filter(AssetEvent.status == status)
+        if isin:
+            q = q.filter(AssetEvent.isin == isin.upper())
+        if dfrom:
+            q = q.filter(AssetEvent.value_date >= dfrom)
+        if dto:
+            q = q.filter(AssetEvent.value_date <= dto)
+
+        rows = (q.order_by(AssetEvent.value_date.asc(), AssetEvent.id.asc())
+                  .limit(limit).offset(offset).all())
+
+        def ser(e: AssetEvent):
+            return {
+                "id": e.id,
+                "user_id": e.user_id,
+                "asset_id": e.asset_id,
+                "target_asset_id": e.target_asset_id,
+                "transfer_group_id": e.transfer_group_id,
+                "kind": e.kind,
+                "status": e.status,
+                "value_date": e.value_date.isoformat(),
+                "rrule": e.rrule,
+                "end_date": e.end_date.isoformat() if e.end_date else None,
+                "amount": float(e.amount) if e.amount is not None else None,
+                "quantity": float(e.quantity) if e.quantity is not None else None,
+                "unit_price": float(e.unit_price) if e.unit_price is not None else None,
+                "isin": e.isin,
+                "portfolio_line_id": e.portfolio_line_id,
+                "category": e.category,
+                "note": e.note,
+                "data": e.data or {},
+                "posted_entity_type": e.posted_entity_type,
+                "posted_entity_id": e.posted_entity_id,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+                "updated_at": e.updated_at.isoformat() if e.updated_at else None,
+            }
+
+        return jsonify([ser(r) for r in rows]), 200
+    finally:
+        session.close()
+
+
+@app.route("/api/events/<int:event_id>", methods=["PUT"])
+@jwt_required()
+def update_event(event_id):
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+    cascade = request.args.get("cascade") == "true"
+
+    session = Session()
+    try:
+        ev = session.query(AssetEvent).filter_by(id=event_id, user_id=user_id).first()
+        if not ev:
+            return jsonify({"ok": False, "error": "event not found"}), 404
+
+        # Mise à jour basique (on ne permet pas de changer 'kind')
+        updatable = {
+            "status": data.get("status"),
+            "value_date": parse_date(data.get("value_date")) if "value_date" in data else ev.value_date,
+            "rrule": data.get("rrule") if "rrule" in data else ev.rrule,
+            "end_date": parse_date(data.get("end_date")) if "end_date" in data else ev.end_date,
+            "amount": parse_float(data.get("amount")) if "amount" in data else ev.amount,
+            "quantity": parse_float(data.get("quantity")) if "quantity" in data else ev.quantity,
+            "unit_price": parse_float(data.get("unit_price")) if "unit_price" in data else ev.unit_price,
+            "isin": (data.get("isin") or ev.isin or "").strip().upper() or None if "isin" in data else ev.isin,
+            "category": data.get("category") if "category" in data else ev.category,
+            "note": data.get("note") if "note" in data else ev.note,
+            "data": data.get("data") if "data" in data else ev.data,
+        }
+
+        # Validation ISIN si modifié pour trade/dividend
+        if ev.kind in ("portfolio_trade","dividend") and "isin" in data:
+            if updatable["isin"] and not ensure_isin_known(session, updatable["isin"]):
+                return jsonify({"ok": False, "error": "ISIN inconnu dans produits_invest"}), 400
+
+        # Transfert => option cascade
+        if ev.kind == "transfer" and cascade:
+            siblings = (session.query(AssetEvent)
+                        .filter(AssetEvent.transfer_group_id == ev.transfer_group_id,
+                                AssetEvent.user_id == user_id)
+                        .all())
+            # on MAJ date, status, rrule, note, category, data, amount symétrique
+            for s in siblings:
+                s.status    = updatable["status"] or s.status
+                s.value_date= updatable["value_date"] or s.value_date
+                s.rrule     = updatable["rrule"] if "rrule" in data else s.rrule
+                s.end_date  = updatable["end_date"] if "end_date" in data else s.end_date
+                s.note      = updatable["note"] if "note" in data else s.note
+                s.category  = updatable["category"] if "category" in data else s.category
+                s.data      = updatable["data"] if "data" in data else s.data
+                if "amount" in data and updatable["amount"] is not None:
+                    s.amount = abs(updatable["amount"]) if s.amount and s.amount > 0 else -abs(updatable["amount"])
+        else:
+            # MAJ simple
+            for k, v in updatable.items():
+                setattr(ev, k, v)
+
+        session.commit()
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        session.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        session.close()
+
+
+@app.route("/api/events/<int:event_id>", methods=["DELETE"])
+@jwt_required()
+def delete_event(event_id):
+    user_id = int(get_jwt_identity())
+    cascade = request.args.get("cascade") == "true"
+
+    session = Session()
+    try:
+        ev = session.query(AssetEvent).filter_by(id=event_id, user_id=user_id).first()
+        if not ev:
+            return jsonify({"ok": False, "error": "event not found"}), 404
+
+        if ev.kind == "transfer" and cascade and ev.transfer_group_id:
+            session.query(AssetEvent).filter_by(
+                transfer_group_id=ev.transfer_group_id, user_id=user_id
+            ).delete(synchronize_session=False)
+        else:
+            session.delete(ev)
+
+        session.commit()
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        session.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        session.close()
+
 
 from auth_google import register_google_auth_route
 register_google_auth_route(app, app.config["JWT_SECRET_KEY"], engine)
