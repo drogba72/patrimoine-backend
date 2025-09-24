@@ -1219,8 +1219,12 @@ def tr_connect():
         resp = tr_connect_api(phone, pin)
         return jsonify({
             "ok": True,
-            "processId": resp["processId"],
-            "countdown": resp["countdownInSeconds"]
+            "processId": resp.get("processId"),
+            "countdown": resp.get("countdownInSeconds"),
+            "challengeType": resp.get("challengeType"),   # p.ex. "PUSH_NOTIFICATION" / "SMS"
+            "otpType": resp.get("otpType"),               # p.ex. "SMS"
+            "delivery": resp.get("delivery"),             # selon l’API, si dispo
+            "message": resp.get("message"),
         }), 200
 
     except Exception as e:
@@ -1418,6 +1422,8 @@ def tr_import():
                 line.beneficiary_id        = parse_int(None if ben in (None, "", "self") else ben)
 
         session.commit()
+        app.logger.info("TR import: %d positions, %d transactions, %d allocations",
+                    len(positions or []), len(transactions or []), len(allocations or []))
         return jsonify({"ok": True, "asset_id": asset.id}), 201
 
     except Exception as e:
