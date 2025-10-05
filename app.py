@@ -302,6 +302,18 @@ def tr_resync_dryrun():
     asset_ids = data.get("asset_ids") or []   # optionnel : liste d'assets ciblés
     token = data.get("token")                 # optionnel : token TR déjà obtenu (via /2fa)
 
+
+    app.logger.info("[TR][resync] link? %s phone? %s pin? %s",
+                bool(link), bool(link and link.phone_e164), bool(link and link.pin_enc))
+    try:
+        pin = dec_secret(link.pin_enc) if (link and link.pin_enc) else None
+        app.logger.info("[TR][resync] decrypt_ok=%s pin_len=%s",
+                        pin is not None and len(pin) > 0, len(pin) if pin else 0)
+    except Exception as e:
+        app.logger.warning("[TR][resync] decrypt_failed: %s", e)
+        pin = None
+
+
     s = Session()
     try:
         # 1) Si pas de token, on tente d'initier la connexion et on demande 2FA
