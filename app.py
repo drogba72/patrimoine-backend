@@ -216,6 +216,242 @@ def upsert_produits_from_positions(session, positions):
 
     return {"existing": list(existing_isins), "created": created}
 
+# app.py (ajoute près des routes TR)
+
+def _normalize_tr_accounts(raw):
+    """Reprend la logique de /broker/traderepublic/portfolio pour normaliser comptes & positions."""
+    def _num(x):
+        try:
+            if x is None:
+                return None
+            if isinstance(x, (int, float)):
+                return float(x)
+            return float(str(x).replace(",", "."))
+        except Exception:
+            return None
+
+    def _flatten_positions(lst):
+        flat = []
+        for it in lst or []:
+            if isinstance(it, dict) and not it.get("isin") and isinstance(it.get("positions"), list):
+                flat.extend(it["positions"])
+            else:
+                flat.append(it)
+        return flat
+
+    # --------- 1) indices PEA/PER éventuels via historique (optionnel ici) ----------
+    hints = {}
+    for tx in raw.get("transactions", []) or []:
+        acc = (str(tx.get("cashAccountNumber") or "").strip())
+        evt = (tx.get("eventType") or "").lower()
+        sub = (tx.get("subtitle") or "").lower()
+        if not acc:
+            continue
+        if evt.startswith("pea_") or "pea" in sub:
+            hints[acc] = "PEA"
+        elif evt.startswith("per_") or "retirement" in sub or " per " in f" {sub} ":
+            hints[acc] = "PER"
+
+    accounts = []
+    for acc in raw.get("accounts", []) or []:
+        cash_acc  = (acc.get("cashAccountNumber") or "").strip()
+        ptype_raw = (acc.get("productType") or "").lower()
+        normalized_type = hints.get(cash_acc) if "tax_wrapper" in ptype_raw else map_tr_product_type(ptype_raw) or "CTO"
+
+        norm_positions = []
+        for p in _flatten_positions(acc.get("positions")):
+            if not (p.get("isin") or p.get("name") or p.get("label")):
+                continue
+            avg = p.get("averageBuyIn")
+            if avg is None and isinstance(p.get("avgPrice"), dict):
+                avg = p["avgPrice"].get("value")
+            elif avg is None:
+                avg = p.get("avgPrice")
+            units = p.get("netSize") or p.get("virtualSize") or p.get("quantity") or p.get("units")
+            norm_positions.append({
+                "isin": p.get("isin"),
+                "name": p.get("name") or p.get("label"),
+                "units": _num(units),
+                "avgPrice": _num(avg),
+                "productType": normalized_type,
+            })
+
+        accounts.append({
+            "productType": normalized_type,  # PEA/CTO/...
+            "positions": norm_positions,
+        })
+
+    return {
+        "cash": raw.get("cash"),
+        "accounts": accounts,
+        "positions_flat": [p for acc in accounts for p in acc["positions"]],
+    }
+
+
+@app.route("/api/broker/traderepublic/resync", methods=["POST"])
+@jwt_required()
+def tr_resync_dryrun():
+    """
+    Dry-run de resync TR:
+    - sans token -> démarre la connexion avec BrokerLink (si PIN mémorisé) et renvoie 412 + processId
+    - avec token -> fetch data TR, calcule le diff vs BDD et LOG UNIQUEMENT les actions qui seraient faites
+    Jamais de write DB ici.
+    """
+    uid = int(get_jwt_identity())
+    data = request.get_json() or {}
+    asset_ids = data.get("asset_ids") or []   # optionnel : liste d'assets ciblés
+    token = data.get("token")                 # optionnel : token TR déjà obtenu (via /2fa)
+
+    s = Session()
+    try:
+        # 1) Si pas de token, on tente d'initier la connexion et on demande 2FA
+        if not token:
+            link = s.query(BrokerLink).filter_by(user_id=uid, broker="Trade Republic").first()
+            if not link:
+                app.logger.info("[TR][resync] AUCUN BrokerLink pour user=%s", uid)
+                return jsonify({"ok": False, "error": "No Trade Republic link"}), 400
+
+            phone = (link.phone_e164 or "").strip()
+            pin = None
+            if link.remember_pin and link.pin_enc:
+                try:
+                    pin = dec_secret(link.pin_enc)
+                except Exception:
+                    pin = None
+
+            if not phone or not pin:
+                app.logger.info("[TR][resync] Missing phone or stored PIN -> besoin 2FA manuel")
+                # On peut quand même lancer le connect pour récupérer un processId (si TR le permet sans PIN),
+                # mais ici on reste simple : on signale au front d'aller faire connect+2FA.
+                return jsonify({"ok": False, "needs2fa": True, "reason": "PIN not stored"}), 412
+
+            # PIN dispo => on tente un connect immédiat (qui retournera sans doute un challenge 2FA)
+            try:
+                resp = tr_connect_api(phone, pin)
+                process_id = resp.get("processId")
+                app.logger.info("[TR][resync] connect lancé processId=%s challenge=%s",
+                                process_id, resp.get("challengeType"))
+                # On renvoie 412 pour que le front collecte le code et appelle /2fa puis nous renvoie le token
+                return jsonify({
+                    "ok": False,
+                    "needs2fa": True,
+                    "processId": process_id,
+                    "challengeType": resp.get("challengeType"),
+                    "countdown": resp.get("countdownInSeconds"),
+                }), 412
+            except Exception as e:
+                app.logger.exception("[TR][resync] connect failed")
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        # 2) Avec token -> on fetch le portefeuille et on calcule un diff
+        raw = tr_fetch_api(token)
+        norm = _normalize_tr_accounts(raw)
+        new_cash = norm.get("cash")
+        new_positions = norm.get("positions_flat")  # [{isin, name, units, avgPrice, productType}]
+
+        # Portefeuilles TR de l’utilisateur à cibler
+        q = (s.query(Asset)
+              .join(AssetPortfolio, AssetPortfolio.asset_id == Asset.id)
+              .filter(Asset.user_id == uid, Asset.type == "portfolio",
+                      AssetPortfolio.broker.ilike("%Trade Republic%")))
+        if asset_ids:
+            q = q.filter(Asset.id.in_(asset_ids))
+
+        portfolios = q.all()
+        preview = []
+
+        for a in portfolios:
+            pf = a.portfolio
+            lines = list(pf.lines or [])
+            by_isin = { (ln.isin or "").upper(): ln for ln in lines if ln.isin }
+
+            incoming_by_isin = {}
+            for p in new_positions or []:
+                isin = (p.get("isin") or "").upper()
+                if not isin:
+                    continue
+                incoming_by_isin[isin] = p
+
+            updates, inserts, deletes = [], [], []
+
+            # updates / deletes
+            for isin, ln in by_isin.items():
+                incoming = incoming_by_isin.get(isin)
+                if incoming:
+                    change = {}
+                    u_old = float(ln.units) if ln.units is not None else None
+                    u_new = float(incoming.get("units")) if incoming.get("units") is not None else None
+                    pru_old = float(ln.avg_price) if ln.avg_price is not None else None
+                    pru_new = float(incoming.get("avgPrice")) if incoming.get("avgPrice") is not None else None
+
+                    if u_old != u_new or pru_old != pru_new:
+                        change = {
+                            "line_id": ln.id,
+                            "isin": isin,
+                            "from": {"units": u_old, "avg_price": pru_old},
+                            "to":   {"units": u_new, "avg_price": pru_new},
+                        }
+                        updates.append(change)
+                        app.logger.info("[TR][resync][DRYRUN][UPDATE] asset=%s line=%s isin=%s units %s->%s avg_price %s->%s",
+                                        a.id, ln.id, isin, u_old, u_new, pru_old, pru_new)
+                else:
+                    # plus de position -> à discuter: suppression ? ou marquer close ? (ici on loggue seulement)
+                    deletes.append({"line_id": ln.id, "isin": isin, "label": ln.label})
+                    app.logger.info("[TR][resync][DRYRUN][DELETE] asset=%s line=%s isin=%s label=%s",
+                                    a.id, ln.id, isin, ln.label)
+
+            # inserts
+            for isin, p in incoming_by_isin.items():
+                if isin not in by_isin:
+                    inserts.append({
+                        "asset_id": a.id,
+                        "isin": isin,
+                        "label": p.get("name"),
+                        "units": p.get("units"),
+                        "avg_price": p.get("avgPrice"),
+                        "product_type": p.get("productType"),
+                    })
+                    app.logger.info("[TR][resync][DRYRUN][INSERT] asset=%s isin=%s label=%s units=%s avg_price=%s type=%s",
+                                    a.id, isin, p.get("name"), p.get("units"), p.get("avgPrice"), p.get("productType"))
+
+            # cash diff
+            old_cash = float(a.current_value) if a.current_value is not None else None
+            cash_num = None
+            try:
+                # supporte number, string ou {amount:{value}}
+                c = new_cash
+                if isinstance(c, dict):
+                    c = (c.get("amount") or {}).get("value", None)
+                cash_num = float(str(c).replace(",", ".")) if c is not None else None
+            except Exception:
+                pass
+
+            if old_cash != cash_num:
+                app.logger.info("[TR][resync][DRYRUN][CASH] asset=%s cash %s -> %s",
+                                a.id, old_cash, cash_num)
+
+            preview.append({
+                "asset_id": a.id,
+                "label": a.label,
+                "cash_from": old_cash,
+                "cash_to": cash_num,
+                "updates": updates,
+                "inserts": inserts,
+                "deletes": deletes,
+            })
+
+        return jsonify({
+            "ok": True,
+            "dry_run": True,
+            "portfolios": len(preview),
+            "preview": preview
+        }), 200
+
+    except Exception as e:
+        app.logger.exception("[TR][resync] failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        s.close()
 
 
 def serialize_asset(asset: Asset, session) -> dict:
