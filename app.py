@@ -25,6 +25,7 @@ from scraper_tr import connect as tr_connect_api, validate_2fa as tr_validate_ap
 import logging
 import sys
 from cryptography.fernet import Fernet, InvalidToken
+from typing import Union
 
 # Configure root logger
 logging.basicConfig(
@@ -82,8 +83,30 @@ except Exception as e:
 def enc_secret(s: str) -> str:
     return _fernet.encrypt(s.encode()).decode("ascii")   # ✅ str
 
-def dec_secret(token: str) -> str:
-    return _fernet.decrypt(token.encode("ascii")).decode()  # ✅ str in -> str out
+def dec_secret(token: Union[str, bytes, bytearray, memoryview]) -> str:
+    """
+    Déchiffre un jeton Fernet provenant d'une colonne TEXT (str) ou BYTEA
+    (bytes/memoryview). Retourne le PIN en clair (str).
+    """
+    if token is None:
+        raise ValueError("empty token")
+
+    # Normalise en bytes
+    if isinstance(token, memoryview):
+        token_bytes = token.tobytes()
+    elif isinstance(token, bytearray):
+        token_bytes = bytes(token)
+    elif isinstance(token, bytes):
+        token_bytes = token
+    elif isinstance(token, str):
+        # Jeton Fernet = base64 urlsafe ASCII
+        token_bytes = token.encode("ascii")
+    else:
+        # fallback ultra-sûr (cas exotique SQLAlchemy): on cast en str
+        token_bytes = str(token).encode("ascii")
+
+    plain = _fernet.decrypt(token_bytes)
+    return plain.decode("utf-8")
 
 
 def parse_float(val):
