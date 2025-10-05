@@ -294,56 +294,47 @@ def tr_resync_dryrun():
     """
     Dry-run de resync TR:
     - sans token -> démarre la connexion avec BrokerLink (si PIN mémorisé) et renvoie 412 + processId
-    - avec token -> fetch data TR, calcule le diff vs BDD et LOG UNIQUEMENT les actions qui seraient faites
-    Jamais de write DB ici.
+    - avec token -> fetch data TR, calcule le diff vs BDD et LOG UNIQUEMENT les actions
     """
     uid = int(get_jwt_identity())
     data = request.get_json() or {}
-    asset_ids = data.get("asset_ids") or []   # optionnel : liste d'assets ciblés
-    token = data.get("token")                 # optionnel : token TR déjà obtenu (via /2fa)
-
-
-    app.logger.info("[TR][resync] link? %s phone? %s pin? %s",
-                bool(link), bool(link and link.phone_e164), bool(link and link.pin_enc))
-    try:
-        pin = dec_secret(link.pin_enc) if (link and link.pin_enc) else None
-        app.logger.info("[TR][resync] decrypt_ok=%s pin_len=%s",
-                        pin is not None and len(pin) > 0, len(pin) if pin else 0)
-    except Exception as e:
-        app.logger.warning("[TR][resync] decrypt_failed: %s", e)
-        pin = None
-
+    asset_ids = data.get("asset_ids") or []
+    token = data.get("token")
 
     s = Session()
     try:
-        # 1) Si pas de token, on tente d'initier la connexion et on demande 2FA
-        if not token:
-            link = s.query(BrokerLink).filter_by(user_id=uid, broker="Trade Republic").first()
-            if not link:
-                app.logger.info("[TR][resync] AUCUN BrokerLink pour user=%s", uid)
-                return jsonify({"ok": False, "error": "No Trade Republic link"}), 400
+        # 1) Récupérer le lien en BDD AVANT de s'en servir
+        link = s.query(BrokerLink).filter_by(user_id=uid, broker="Trade Republic").first()
+        app.logger.info(
+            "[TR][resync] link? %s phone? %s pin? %s",
+            bool(link), bool(link and link.phone_e164), bool(link and link.pin_enc)
+        )
 
-            phone = (link.phone_e164 or "").strip()
+        # 2) Pas de token -> on déclenche le challenge (ou on dit au front de le faire)
+        if not token:
+            phone = (link.phone_e164 or "").strip() if link else ""
             pin = None
-            if link.remember_pin and link.pin_enc:
+            if link and link.remember_pin and link.pin_enc:
                 try:
                     pin = dec_secret(link.pin_enc)
-                except Exception:
+                    app.logger.info("[TR][resync] decrypt_ok=%s pin_len=%s", True, len(pin))
+                except Exception as e:
+                    app.logger.warning("[TR][resync] decrypt_failed: %s", e)
                     pin = None
 
             if not phone or not pin:
                 app.logger.info("[TR][resync] Missing phone or stored PIN -> besoin 2FA manuel")
-                # On peut quand même lancer le connect pour récupérer un processId (si TR le permet sans PIN),
-                # mais ici on reste simple : on signale au front d'aller faire connect+2FA.
+                # Le front appellera /connect pour obtenir un processId puis /2fa
                 return jsonify({"ok": False, "needs2fa": True, "reason": "PIN not stored"}), 412
 
-            # PIN dispo => on tente un connect immédiat (qui retournera sans doute un challenge 2FA)
+            # Si on a tout, on peut lancer le connect pour récupérer un processId tout de suite
             try:
                 resp = tr_connect_api(phone, pin)
                 process_id = resp.get("processId")
-                app.logger.info("[TR][resync] connect lancé processId=%s challenge=%s",
-                                process_id, resp.get("challengeType"))
-                # On renvoie 412 pour que le front collecte le code et appelle /2fa puis nous renvoie le token
+                app.logger.info(
+                    "[TR][resync] connect lancé processId=%s challenge=%s",
+                    process_id, resp.get("challengeType")
+                )
                 return jsonify({
                     "ok": False,
                     "needs2fa": True,
@@ -355,13 +346,12 @@ def tr_resync_dryrun():
                 app.logger.exception("[TR][resync] connect failed")
                 return jsonify({"ok": False, "error": str(e)}), 500
 
-        # 2) Avec token -> on fetch le portefeuille et on calcule un diff
+        # 3) Avec token -> fetch + dry-run
         raw = tr_fetch_api(token)
         norm = _normalize_tr_accounts(raw)
         new_cash = norm.get("cash")
         new_positions = norm.get("positions_flat")  # [{isin, name, units, avgPrice, productType}]
 
-        # Portefeuilles TR de l’utilisateur à cibler
         q = (s.query(Asset)
               .join(AssetPortfolio, AssetPortfolio.asset_id == Asset.id)
               .filter(Asset.user_id == uid, Asset.type == "portfolio",
@@ -375,7 +365,7 @@ def tr_resync_dryrun():
         for a in portfolios:
             pf = a.portfolio
             lines = list(pf.lines or [])
-            by_isin = { (ln.isin or "").upper(): ln for ln in lines if ln.isin }
+            by_isin = {(ln.isin or "").upper(): ln for ln in lines if ln.isin}
 
             incoming_by_isin = {}
             for p in new_positions or []:
@@ -390,24 +380,20 @@ def tr_resync_dryrun():
             for isin, ln in by_isin.items():
                 incoming = incoming_by_isin.get(isin)
                 if incoming:
-                    change = {}
                     u_old = float(ln.units) if ln.units is not None else None
                     u_new = float(incoming.get("units")) if incoming.get("units") is not None else None
                     pru_old = float(ln.avg_price) if ln.avg_price is not None else None
                     pru_new = float(incoming.get("avgPrice")) if incoming.get("avgPrice") is not None else None
-
                     if u_old != u_new or pru_old != pru_new:
-                        change = {
+                        updates.append({
                             "line_id": ln.id,
                             "isin": isin,
                             "from": {"units": u_old, "avg_price": pru_old},
                             "to":   {"units": u_new, "avg_price": pru_new},
-                        }
-                        updates.append(change)
+                        })
                         app.logger.info("[TR][resync][DRYRUN][UPDATE] asset=%s line=%s isin=%s units %s->%s avg_price %s->%s",
                                         a.id, ln.id, isin, u_old, u_new, pru_old, pru_new)
                 else:
-                    # plus de position -> à discuter: suppression ? ou marquer close ? (ici on loggue seulement)
                     deletes.append({"line_id": ln.id, "isin": isin, "label": ln.label})
                     app.logger.info("[TR][resync][DRYRUN][DELETE] asset=%s line=%s isin=%s label=%s",
                                     a.id, ln.id, isin, ln.label)
@@ -430,7 +416,6 @@ def tr_resync_dryrun():
             old_cash = float(a.current_value) if a.current_value is not None else None
             cash_num = None
             try:
-                # supporte number, string ou {amount:{value}}
                 c = new_cash
                 if isinstance(c, dict):
                     c = (c.get("amount") or {}).get("value", None)
@@ -439,8 +424,7 @@ def tr_resync_dryrun():
                 pass
 
             if old_cash != cash_num:
-                app.logger.info("[TR][resync][DRYRUN][CASH] asset=%s cash %s -> %s",
-                                a.id, old_cash, cash_num)
+                app.logger.info("[TR][resync][DRYRUN][CASH] asset=%s cash %s -> %s", a.id, old_cash, cash_num)
 
             preview.append({
                 "asset_id": a.id,
@@ -452,12 +436,7 @@ def tr_resync_dryrun():
                 "deletes": deletes,
             })
 
-        return jsonify({
-            "ok": True,
-            "dry_run": True,
-            "portfolios": len(preview),
-            "preview": preview
-        }), 200
+        return jsonify({"ok": True, "dry_run": True, "portfolios": len(preview), "preview": preview}), 200
 
     except Exception as e:
         app.logger.exception("[TR][resync] failed")
