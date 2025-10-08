@@ -2017,9 +2017,9 @@ def tr_import():
 # Portfolio Transactions
 # ---------------------------------------------------------
 
-@app.route("/api/portfolios/<int:portfolio_id>/transactions", methods=["GET"])
+@app.route("/api/assets/<int:asset_id>/transactions", methods=["GET"], endpoint="list_portfolio_transactions_by_asset")
 @jwt_required()
-def list_portfolio_transactions(portfolio_id):
+def list_portfolio_transactions_by_asset(asset_id):
     user_id = int(get_jwt_identity())
     session = Session()
     try:
