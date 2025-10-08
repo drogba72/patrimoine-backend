@@ -114,6 +114,20 @@ def parse_date(val):
     except Exception:
         return None
 
+def _extract_cash_amount(cash_obj):
+    # Accepts number, string, or dicts from TR.
+    if cash_obj is None:
+        return None
+    # numeric or string-like
+    if isinstance(cash_obj, (int, float, Decimal, str)):
+        return parse_float(cash_obj)
+    # dict shape: try common keys
+    if isinstance(cash_obj, dict):
+        for key in ("amount", "value", "balance", "cash", "cashBalance"):
+            if key in cash_obj:
+                return parse_float(cash_obj.get(key))
+    return None
+
 def enc_secret(s: str) -> str:
     return _fernet.encrypt(s.encode()).decode("ascii")   # ✅ str
 
@@ -165,17 +179,6 @@ def ensure_isin_known(session, isin: str) -> bool:
         return True
     return session.query(ProduitInvest).filter(ProduitInvest.isin == isin).first() is not None
 
-
-def parse_date(val):
-    try:
-        if not val:
-            return None
-        s = str(val).strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        return datetime.fromisoformat(s).date()
-    except Exception:
-        return None
 
 def get_or_create_product(session, pf_id, ptype):
     if not ptype:
@@ -427,8 +430,9 @@ def _normalize_tr_accounts(raw):
     # ---------- 4) sortie ----------
     positions_flat = [pos for a in accounts for pos in a.get("positions", [])]
 
+    cash_value = _extract_cash_amount(raw.get("cash"))
     return {
-        "cash": raw.get("cash"),
+        "cash": cash_value,           # always a float/None
         "accounts": accounts,
         "positions_flat": positions_flat,
     }
@@ -679,13 +683,7 @@ def tr_resync_dryrun():
         raw = tr_fetch_api(token)
         norm = _normalize_tr_accounts(raw)
         new_cash_raw = norm.get("cash")
-        # TR renvoie parfois un dict {value, currency}. On sécurise :
-        if isinstance(new_cash_raw, dict):
-            new_cash = parse_float(new_cash_raw.get("value"))
-        else:
-            new_cash = parse_float(new_cash_raw)
-
-        new_cash = norm.get("cash")
+        new_cash = _extract_cash_amount(new_cash_raw)
         new_positions = norm.get("positions_flat")  # [{isin, name, units, avgPrice, productType}]
         tr_txs = raw.get("transactions") or []
         tx_total_tr = len(tr_txs)
@@ -816,15 +814,11 @@ def tr_resync_dryrun():
         if apply_cash:
             if new_cash is None:
                 return jsonify({"ok": False, "error": "Cash TR manquant/illisible"}), 400
-
             if not portfolios:
                 return jsonify({"ok": False, "error": "Aucun portefeuille Trade Republic ciblé."}), 400
 
             for a in portfolios:
-                # ici on choisit de poser le cash TR sur assets.current_value
-                a.current_value = new_cash
-                cash_update["updated_assets"].append(a.id)
-
+                a.current_value = Decimal(str(new_cash))  # ✅ avoid float rounding
             s.commit()
             cash_update["applied"] = True
         else:
@@ -2013,6 +2007,11 @@ def tr_portfolio():
 
         raw = tr_fetch_api(token)
         # raw doit contenir au moins: cash, accounts (avec positions), transactions
+        norm = _normalize_tr_accounts(raw)
+
+        new_cash = _extract_cash_amount(norm.get("cash"))  # ✅ one source of truth
+        new_positions = norm.get("positions_flat")
+        tr_txs = raw.get("transactions") or []
 
         # ---------- 1) Indices PEA/PER par compte depuis l'historique ----------
         hints = {}
@@ -2183,7 +2182,7 @@ def tr_import():
 # Portfolio Transactions
 # ---------------------------------------------------------
 
-@app.route("/api/assets/<int:asset_id>/transactions", methods=["GET"], endpoint="list_portfolio_transactions_by_asset")
+@app.route("/api/assets/<int:asset_id>/transactionsX", methods=["GET"], endpoint="list_portfolio_transactions_by_asset")
 @jwt_required()
 def list_portfolio_transactions_by_asset(asset_id):
     user_id = int(get_jwt_identity())
