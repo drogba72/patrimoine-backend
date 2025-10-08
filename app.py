@@ -26,6 +26,8 @@ import logging
 import sys
 from cryptography.fernet import Fernet, InvalidToken
 from typing import Union
+import hashlib
+from decimal import Decimal
 
 # Configure root logger
 logging.basicConfig(
@@ -66,6 +68,14 @@ app.config["JWT_SECRET_KEY"] = os.getenv("SECRET_KEY", "supersecret")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=12)
 app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)
 jwt = JWTManager(app)
+
+
+TR_EXEC_TYPES     = {"trading_savingsplan_executed", "trading_trade_executed"}
+TR_DIV_TYPES      = {"dividend_payout", "dividend"}
+TR_INTEREST_TYPES = {"interest_payout", "interest_credit"}
+TR_FEE_TYPES      = {"fee_charged", "trading_fee_charged"}
+TR_DEPOSIT_TYPES  = {"incoming_transfer_delegation", "deposit_credit", "pea_activation_deposit"}
+TR_PAYIN_TYPES    = {"pea_savings_plan_pay_in", "pea_deposit_debit"}
 
 # ---------------------------------------------------------
 # Helpers
@@ -310,6 +320,120 @@ def _normalize_tr_accounts(raw):
         "positions_flat": [p for acc in accounts for p in acc["positions"]],
     }
 
+
+def _tr_tx_uid(tx: dict) -> str:
+    raw = tx.get("id") or tx.get("uuid")
+    if raw:
+        return f"tr:{raw}"
+    payload = "|".join(str(tx.get(k) or "") for k in ("type","time","date","label","name","isin","amount"))
+    return "tr:" + hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+def _map_tr_tx_to_event(tx: dict) -> dict:
+    t = (tx.get("type") or "").lower()
+    label = tx.get("label") or tx.get("name")
+    value_date = parse_date(tx.get("time") or tx.get("date"))
+    amount = parse_float(tx.get("amount"))
+    isin = (tx.get("isin") or "").strip().upper() or None
+    quantity = parse_float(tx.get("quantity"))
+
+    ev = {
+        "kind": "other",
+        "category": t,
+        "value_date": value_date,
+        "amount": amount,
+        "quantity": None,
+        "unit_price": None,
+        "isin": isin,
+        "note": label,
+        "tx_type": None,  # buy / sell / dividend pour la table miroir
+    }
+
+    if t in TR_EXEC_TYPES:
+        ev["kind"] = "portfolio_trade"
+        ev["quantity"] = quantity
+        ev["unit_price"] = (abs(amount)/quantity) if (amount is not None and quantity) else None
+        ev["tx_type"] = "buy" if (amount or 0) < 0 else "sell"
+    elif t in TR_DIV_TYPES:
+        ev["kind"] = "dividend"
+        ev["tx_type"] = "dividend"
+    elif t in TR_INTEREST_TYPES:
+        ev["kind"] = "cash_op"; ev["category"] = "interest"
+    elif t in TR_FEE_TYPES:
+        ev["kind"] = "cash_op"; ev["category"] = "fee"
+    elif t in TR_DEPOSIT_TYPES:
+        ev["kind"] = "cash_op"; ev["category"] = "deposit"
+    elif t in TR_PAYIN_TYPES:
+        ev["kind"] = "cash_op"; ev["category"] = "pay_in"
+    return ev
+
+def upsert_tr_asset_events(session, user_id: int, asset: Asset, tr_transactions: list) -> dict:
+    pf = session.query(AssetPortfolio).filter_by(asset_id=asset.id).first()
+    created = updated = linked = 0
+
+    for tx in (tr_transactions or []):
+        uid = _tr_tx_uid(tx)
+        mapped = _map_tr_tx_to_event(tx)
+
+        # garde-fous
+        if not mapped["value_date"] or mapped["amount"] is None:
+            continue
+
+        # idempotence via data.tr_uid
+        existing = (session.query(AssetEvent)
+                    .filter(AssetEvent.user_id == user_id,
+                            AssetEvent.asset_id == asset.id,
+                            AssetEvent.data['tr_uid'].astext == uid)
+                    .first())
+
+        if existing:
+            changed = False
+            for k in ("kind","value_date","amount","quantity","unit_price","isin","category","note"):
+                v = mapped[k]
+                if v is not None and getattr(existing, k) != v:
+                    setattr(existing, k, v); changed = True
+            if changed:
+                existing.data = {**(existing.data or {}), "tr_raw": tx, "tr_type": tx.get("type"), "tr_uid": uid}
+                updated += 1
+            ev = existing
+        else:
+            ev = AssetEvent(
+                user_id=user_id, asset_id=asset.id, status="posted",
+                kind=mapped["kind"], value_date=mapped["value_date"],
+                amount=mapped["amount"], quantity=mapped["quantity"],
+                unit_price=mapped["unit_price"], isin=mapped["isin"],
+                category=mapped["category"], note=mapped["note"],
+                data={"tr_uid": uid, "tr_type": tx.get("type"), "tr_raw": tx}
+            )
+            session.add(ev); session.flush()
+            created += 1
+
+        # miroir portfolio_transactions pour trades/dividendes (même logique que POST /api/events)
+        if pf and ev.kind in ("portfolio_trade","dividend"):
+            if not ev.posted_entity_id:
+                tx_row = PortfolioTransaction(
+                    portfolio_id=pf.id,
+                    isin=ev.isin,
+                    label=ev.note,
+                    transaction_type=mapped["tx_type"],
+                    quantity=ev.quantity if ev.kind == "portfolio_trade" else None,
+                    amount=ev.amount,
+                    date=ev.value_date
+                )
+                session.add(tx_row); session.flush()
+                ev.posted_entity_type = "portfolio_transaction"
+                ev.posted_entity_id = tx_row.id
+                linked += 1
+            else:
+                pt = session.query(PortfolioTransaction).get(ev.posted_entity_id)
+                if pt:
+                    pt.transaction_type = mapped["tx_type"] or pt.transaction_type
+                    pt.quantity = ev.quantity if ev.kind == "portfolio_trade" else pt.quantity
+                    pt.amount = ev.amount
+                    pt.date = ev.value_date
+
+    session.commit()
+    return {"created": created, "updated": updated, "linked": linked}
+
 @app.route("/api/portfolios/<int:asset_id>/transactions", methods=["GET"])
 @jwt_required()
 def list_portfolio_transactions(asset_id):
@@ -355,14 +479,19 @@ def list_portfolio_transactions(asset_id):
 @jwt_required()
 def tr_resync_dryrun():
     """
-    Dry-run de resync TR:
-    - sans token -> démarre la connexion avec BrokerLink (si PIN mémorisé) et renvoie 412 + processId
-    - avec token -> fetch data TR, calcule le diff vs BDD et LOG UNIQUEMENT les actions
+    Resync Trade Republic en mode 'crescendo'
+    - sans token -> démarre la connexion (si PIN mémorisé) et renvoie 412 + processId
+    - avec token + list_only=true -> listing pur (dry-run)
+    - avec token + list_only=false -> dry-run global, avec possibilité d'appliquer UNIQUEMENT l'upsert des transactions
+      si apply = { "transactions": true }
     """
     uid = int(get_jwt_identity())
     data = request.get_json() or {}
     asset_ids = data.get("asset_ids") or []
     token = data.get("token")
+    list_only = bool(data.get("list_only"))
+    apply = data.get("apply") or {}
+    apply_tx = bool(apply.get("transactions"))  # 👈 n'appliquer que les transactions
 
     s = Session()
     try:
@@ -409,15 +538,15 @@ def tr_resync_dryrun():
                 app.logger.exception("[TR][resync] connect failed")
                 return jsonify({"ok": False, "error": str(e)}), 500
 
-        # 3) Avec token -> fetch + dry-run
+        # 3) Avec token -> fetch + normalisation
         raw = tr_fetch_api(token)
         norm = _normalize_tr_accounts(raw)
         new_cash = norm.get("cash")
         new_positions = norm.get("positions_flat")  # [{isin, name, units, avgPrice, productType}]
+        tr_txs = raw.get("transactions") or []
+        tx_total_tr = len(tr_txs)
 
-        list_only = bool(data.get("list_only"))
-
-        # ⚠️ On charge aussi les transactions associées pour le listing BDD
+        # 4) Charger les portefeuilles TR visés (avec lignes + produits + transactions pour l'état BDD)
         q = (
             s.query(Asset)
             .options(
@@ -427,7 +556,7 @@ def tr_resync_dryrun():
                 joinedload(Asset.portfolio)
                     .joinedload(AssetPortfolio.products),
                 joinedload(Asset.portfolio)
-                    .joinedload(AssetPortfolio.transactions)  # 👈 ajout pour le dump BDD
+                    .joinedload(AssetPortfolio.transactions)
             )
             .join(AssetPortfolio, AssetPortfolio.asset_id == Asset.id)
             .filter(Asset.user_id == uid, Asset.type == "portfolio",
@@ -438,8 +567,8 @@ def tr_resync_dryrun():
 
         portfolios = q.all()
 
+        # 5) Mode LIST-ONLY : listing et logs, aucune écriture
         if list_only:
-            # 1) Résumé global TR (normalisé par compte, positions et transactions)
             tr_summary = {
                 "cash": norm.get("cash"),
                 "accounts": [
@@ -449,10 +578,9 @@ def tr_resync_dryrun():
                     } for acc in (norm.get("accounts") or [])
                 ],
                 "positions_total": len(norm.get("positions_flat") or []),
-                "transactions_total": len(raw.get("transactions") or []),
+                "transactions_total": tx_total_tr,
             }
 
-            # 2) Dump BDD (produits, lignes + typage, transactions) pour chaque portfolio ciblé
             def _pt_for_line(pf, ln):
                 if ln.product and ln.product.product_type:
                     return ln.product.product_type
@@ -489,18 +617,8 @@ def tr_resync_dryrun():
                     } for tx in (pf.transactions or [])],
                 })
 
-            listing = {
-                "ok": True,
-                "mode": "listing",
-                "dry_run": True,
-                "tr": tr_summary,
-                "db": {"portfolios": db_portfolios}
-            }
-
-            # 3) LOGS côté serveur (lisibles)
             try:
                 app.logger.info("📦 [TR][LIST] GLOBAL = %s", json.dumps(tr_summary, ensure_ascii=False, indent=2)[:80000])
-                # On loggue une vue compacte des portefeuilles pour ne pas exploser les logs
                 compact = [{"asset_id": d["asset_id"],
                             "asset_label": d["asset_label"],
                             "products": d["products"],
@@ -510,14 +628,73 @@ def tr_resync_dryrun():
             except Exception:
                 pass
 
-            return jsonify(listing), 200
+            return jsonify({
+                "ok": True,
+                "mode": "listing",
+                "dry_run": True,
+                "tr": tr_summary,
+                "db": {"portfolios": db_portfolios}
+            }), 200
+
+        # 6) Mode DRY-RUN (avec option apply.transactions)
+        #    -> on ne touche ni cash ni positions (on log seulement)
+        diff_summary = {
+            "cash": {"tr": new_cash, "db": None, "delta": None},
+            "positions": {
+                "tr_count": len(new_positions or []),
+                "db_count": sum(len(a.portfolio.lines or []) for a in portfolios),
+            }
+        }
+
+        # Application sélective des transactions
+        tx_stats_global = {"created": 0, "updated": 0, "linked": 0}
+
+        if apply_tx:
+            if not portfolios:
+                return jsonify({
+                    "ok": False,
+                    "error": "Aucun portefeuille Trade Republic ciblé. Passe 'asset_ids' si nécessaire."
+                }), 400
+
+            for asset in portfolios:
+                stats = upsert_tr_asset_events(s, uid, asset, tr_txs)
+                # upsert_tr_asset_events commit déjà; on agrège les stats
+                for k in tx_stats_global:
+                    tx_stats_global[k] += int(stats.get(k, 0))
+
+            app.logger.info("🧾 [TR][APPLY_TX] Upsert events OK: %s (source tx=%d)",
+                            tx_stats_global, tx_total_tr)
+        else:
+            app.logger.info("🧪 [TR][DRYRUN] Transactions détectées: %d (aucune écriture)", tx_total_tr)
+
+        # Vue compacte BDD pour retour
+        db_compact = [{
+            "asset_id": a.id,
+            "asset_label": a.label,
+            "broker": a.portfolio.broker,
+            "lines_count": len(a.portfolio.lines or []),
+            "transactions_count": len(a.portfolio.transactions or [])
+        } for a in portfolios]
+
+        return jsonify({
+            "ok": True,
+            "mode": "dry_run_except_transactions" if apply_tx else "dry_run",
+            "apply": {"transactions": apply_tx},
+            "tr": {
+                "cash": new_cash,
+                "positions_total": len(new_positions or []),
+                "transactions_total": tx_total_tr
+            },
+            "db": {"portfolios": db_compact},
+            "diff": diff_summary,
+            "tx_upsert_stats": tx_stats_global if apply_tx else None
+        }), 200
 
     except Exception as e:
         app.logger.exception("[TR][resync] failed")
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
         s.close()
-
 
 def serialize_asset(asset: Asset, session) -> dict:
     base = {
@@ -1821,6 +1998,10 @@ def tr_import():
         session.commit()
         app.logger.info("TR import: %d positions, %d transactions, %d allocations",
                     len(positions or []), len(transactions or []), len(allocations or []))
+        
+        stats = upsert_tr_asset_events(session, user_id, asset, transactions)
+        app.logger.info("TR events upsert: %s", stats)
+
         return jsonify({"ok": True, "asset_id": asset.id}), 201
 
     except Exception as e:
