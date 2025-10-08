@@ -375,15 +375,19 @@ def tr_resync_dryrun():
         new_cash = norm.get("cash")
         new_positions = norm.get("positions_flat")  # [{isin, name, units, avgPrice, productType}]
 
+        list_only = bool(data.get("list_only"))
+
+        # ⚠️ On charge aussi les transactions associées pour le listing BDD
         q = (
             s.query(Asset)
             .options(
-                # on charge tout ce qu’il faut en 1x
                 joinedload(Asset.portfolio)
                     .joinedload(AssetPortfolio.lines)
                     .joinedload(PortfolioLine.product),
                 joinedload(Asset.portfolio)
-                    .joinedload(AssetPortfolio.products)
+                    .joinedload(AssetPortfolio.products),
+                joinedload(Asset.portfolio)
+                    .joinedload(AssetPortfolio.transactions)  # 👈 ajout pour le dump BDD
             )
             .join(AssetPortfolio, AssetPortfolio.asset_id == Asset.id)
             .filter(Asset.user_id == uid, Asset.type == "portfolio",
@@ -393,115 +397,80 @@ def tr_resync_dryrun():
             q = q.filter(Asset.id.in_(asset_ids))
 
         portfolios = q.all()
-        preview = []
 
-        for a in portfolios:
-            pf = a.portfolio
-            lines = list(pf.lines or [])
-            by_isin = {(ln.isin or "").upper(): ln for ln in lines if ln.isin}
+        if list_only:
+            # 1) Résumé global TR (normalisé par compte, positions et transactions)
+            tr_summary = {
+                "cash": norm.get("cash"),
+                "accounts": [
+                    {
+                        "productType": acc.get("productType"),
+                        "positions_count": len(acc.get("positions") or []),
+                    } for acc in (norm.get("accounts") or [])
+                ],
+                "positions_total": len(norm.get("positions_flat") or []),
+                "transactions_total": len(raw.get("transactions") or []),
+            }
 
-            incoming_by_isin = {}
-            for p in new_positions or []:
-                isin = (p.get("isin") or "").upper()
-                if not isin:
-                    continue
-                incoming_by_isin[isin] = p
+            # 2) Dump BDD (produits, lignes + typage, transactions) pour chaque portfolio ciblé
+            def _pt_for_line(pf, ln):
+                if ln.product and ln.product.product_type:
+                    return ln.product.product_type
+                for pp in pf.products or []:
+                    if ln.product_id == pp.id:
+                        return pp.product_type
+                return None
 
-            updates, inserts, deletes = [], [], []
-
-            # updates / deletes
-            for isin, ln in by_isin.items():
-                incoming = incoming_by_isin.get(isin)
-                # product_type local depuis la BDD
-                ptype_local = (
-                    ln.product.product_type if ln.product else
-                    next((pp.product_type for pp in pf.products if pp.id == ln.product_id), None)
-                )
-                if incoming:
-                    u_old = float(ln.units) if ln.units is not None else None
-                    u_new = float(incoming.get("units")) if incoming.get("units") is not None else None
-                    pru_old = float(ln.avg_price) if ln.avg_price is not None else None
-                    pru_new = float(incoming.get("avgPrice")) if incoming.get("avgPrice") is not None else None
-                    ptype_new = incoming.get("productType")
-
-                    # on déclenche un update si UN SEUL de ces champs diffère
-                    if (u_old != u_new) or (pru_old != pru_new) or (ptype_new and ptype_new != ptype_local):
-                        updates.append({
-                            "line_id": ln.id,
-                            "isin": isin,
-                            "from": {
-                                "units": u_old,
-                                "avg_price": pru_old,
-                                "product_type": ptype_local,
-                                "beneficiary_id": ln.beneficiary_id,
-                            },
-                            "to": {
-                                "units": u_new,
-                                "avg_price": pru_new,
-                                "product_type": ptype_new,
-                                "beneficiary_id": ln.beneficiary_id,
-                            },
-                        })
-                        app.logger.info(
-                            "[TR][resync][DRYRUN][UPDATE] asset=%s line=%s isin=%s "
-                            "units %s->%s avg_price %s->%s type %s->%s",
-                            a.id, ln.id, isin, u_old, u_new, pru_old, pru_new, ptype_local, ptype_new
-                        )
-                else:
-                    deletes.append({
-                        "line_id": ln.id,
-                        "isin": isin,
+            db_portfolios = []
+            for a in portfolios:
+                pf = a.portfolio
+                db_portfolios.append({
+                    "asset_id": a.id,
+                    "asset_label": a.label,
+                    "broker": pf.broker,
+                    "products": [{"id": pp.id, "product_type": pp.product_type} for pp in (pf.products or [])],
+                    "lines": [{
+                        "id": ln.id,
+                        "isin": ln.isin,
                         "label": ln.label,
-                        "product_type": ptype_local,
+                        "units": float(ln.units) if ln.units is not None else None,
+                        "avg_price": float(ln.avg_price) if ln.avg_price is not None else None,
+                        "product_type": _pt_for_line(pf, ln),
                         "beneficiary_id": ln.beneficiary_id,
-                    })
-                    app.logger.info(
-                        "[TR][resync][DRYRUN][DELETE] asset=%s line=%s isin=%s label=%s type=%s bene=%s",
-                        a.id, ln.id, isin, ln.label, ptype_local, ln.beneficiary_id
-                    )
+                    } for ln in (pf.lines or [])],
+                    "transactions": [{
+                        "id": tx.id,
+                        "date": tx.date.isoformat(),
+                        "transaction_type": tx.transaction_type,
+                        "isin": tx.isin,
+                        "label": tx.label,
+                        "quantity": float(tx.quantity) if tx.quantity is not None else None,
+                        "amount": float(tx.amount) if tx.amount is not None else None,
+                    } for tx in (pf.transactions or [])],
+                })
 
-            # inserts
-            for isin, p in incoming_by_isin.items():
-                if isin not in by_isin:
-                    inserts.append({
-                        "asset_id": a.id,
-                        "isin": isin,
-                        "label": p.get("name"),
-                        "units": p.get("units"),
-                        "avg_price": p.get("avgPrice"),
-                        "product_type": p.get("productType"),
-                        "beneficiary_id": None,  # par défaut: non assigné
-                    })
-                    app.logger.info(
-                        "[TR][resync][DRYRUN][INSERT] asset=%s isin=%s label=%s units=%s avg_price=%s type=%s",
-                        a.id, isin, p.get("name"), p.get("units"), p.get("avgPrice"), p.get("productType")
-                    )
+            listing = {
+                "ok": True,
+                "mode": "listing",
+                "dry_run": True,
+                "tr": tr_summary,
+                "db": {"portfolios": db_portfolios}
+            }
 
-            # cash diff
-            old_cash = float(a.current_value) if a.current_value is not None else None
-            cash_num = None
+            # 3) LOGS côté serveur (lisibles)
             try:
-                c = new_cash
-                if isinstance(c, dict):
-                    c = (c.get("amount") or {}).get("value", None)
-                cash_num = float(str(c).replace(",", ".")) if c is not None else None
+                app.logger.info("📦 [TR][LIST] GLOBAL = %s", json.dumps(tr_summary, ensure_ascii=False, indent=2)[:80000])
+                # On loggue une vue compacte des portefeuilles pour ne pas exploser les logs
+                compact = [{"asset_id": d["asset_id"],
+                            "asset_label": d["asset_label"],
+                            "products": d["products"],
+                            "lines_count": len(d["lines"]),
+                            "transactions_count": len(d["transactions"])} for d in db_portfolios]
+                app.logger.info("🗄️ [DB][LIST] PORTFOLIOS = %s", json.dumps(compact, ensure_ascii=False, indent=2)[:80000])
             except Exception:
                 pass
 
-            if old_cash != cash_num:
-                app.logger.info("[TR][resync][DRYRUN][CASH] asset=%s cash %s -> %s", a.id, old_cash, cash_num)
-
-            preview.append({
-                "asset_id": a.id,
-                "label": a.label,
-                "cash_from": old_cash,
-                "cash_to": cash_num,
-                "updates": updates,
-                "inserts": inserts,
-                "deletes": deletes,
-            })
-
-        return jsonify({"ok": True, "dry_run": True, "portfolios": len(preview), "preview": preview}), 200
+            return jsonify(listing), 200
 
     except Exception as e:
         app.logger.exception("[TR][resync] failed")
