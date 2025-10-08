@@ -2,7 +2,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, joinedload
 import os
 from dotenv import load_dotenv
 from models import (
@@ -375,10 +375,20 @@ def tr_resync_dryrun():
         new_cash = norm.get("cash")
         new_positions = norm.get("positions_flat")  # [{isin, name, units, avgPrice, productType}]
 
-        q = (s.query(Asset)
-              .join(AssetPortfolio, AssetPortfolio.asset_id == Asset.id)
-              .filter(Asset.user_id == uid, Asset.type == "portfolio",
-                      AssetPortfolio.broker.ilike("%Trade Republic%")))
+        q = (
+            s.query(Asset)
+            .options(
+                # on charge tout ce qu’il faut en 1x
+                joinedload(Asset.portfolio)
+                    .joinedload(AssetPortfolio.lines)
+                    .joinedload(PortfolioLine.product),
+                joinedload(Asset.portfolio)
+                    .joinedload(AssetPortfolio.products)
+            )
+            .join(AssetPortfolio, AssetPortfolio.asset_id == Asset.id)
+            .filter(Asset.user_id == uid, Asset.type == "portfolio",
+                    AssetPortfolio.broker.ilike("%Trade Republic%"))
+        )
         if asset_ids:
             q = q.filter(Asset.id.in_(asset_ids))
 
@@ -402,24 +412,53 @@ def tr_resync_dryrun():
             # updates / deletes
             for isin, ln in by_isin.items():
                 incoming = incoming_by_isin.get(isin)
+                # product_type local depuis la BDD
+                ptype_local = (
+                    ln.product.product_type if ln.product else
+                    next((pp.product_type for pp in pf.products if pp.id == ln.product_id), None)
+                )
                 if incoming:
                     u_old = float(ln.units) if ln.units is not None else None
                     u_new = float(incoming.get("units")) if incoming.get("units") is not None else None
                     pru_old = float(ln.avg_price) if ln.avg_price is not None else None
                     pru_new = float(incoming.get("avgPrice")) if incoming.get("avgPrice") is not None else None
-                    if u_old != u_new or pru_old != pru_new:
+                    ptype_new = incoming.get("productType")
+
+                    # on déclenche un update si UN SEUL de ces champs diffère
+                    if (u_old != u_new) or (pru_old != pru_new) or (ptype_new and ptype_new != ptype_local):
                         updates.append({
                             "line_id": ln.id,
                             "isin": isin,
-                            "from": {"units": u_old, "avg_price": pru_old},
-                            "to":   {"units": u_new, "avg_price": pru_new},
+                            "from": {
+                                "units": u_old,
+                                "avg_price": pru_old,
+                                "product_type": ptype_local,
+                                "beneficiary_id": ln.beneficiary_id,
+                            },
+                            "to": {
+                                "units": u_new,
+                                "avg_price": pru_new,
+                                "product_type": ptype_new,
+                                "beneficiary_id": ln.beneficiary_id,
+                            },
                         })
-                        app.logger.info("[TR][resync][DRYRUN][UPDATE] asset=%s line=%s isin=%s units %s->%s avg_price %s->%s",
-                                        a.id, ln.id, isin, u_old, u_new, pru_old, pru_new)
+                        app.logger.info(
+                            "[TR][resync][DRYRUN][UPDATE] asset=%s line=%s isin=%s "
+                            "units %s->%s avg_price %s->%s type %s->%s",
+                            a.id, ln.id, isin, u_old, u_new, pru_old, pru_new, ptype_local, ptype_new
+                        )
                 else:
-                    deletes.append({"line_id": ln.id, "isin": isin, "label": ln.label})
-                    app.logger.info("[TR][resync][DRYRUN][DELETE] asset=%s line=%s isin=%s label=%s",
-                                    a.id, ln.id, isin, ln.label)
+                    deletes.append({
+                        "line_id": ln.id,
+                        "isin": isin,
+                        "label": ln.label,
+                        "product_type": ptype_local,
+                        "beneficiary_id": ln.beneficiary_id,
+                    })
+                    app.logger.info(
+                        "[TR][resync][DRYRUN][DELETE] asset=%s line=%s isin=%s label=%s type=%s bene=%s",
+                        a.id, ln.id, isin, ln.label, ptype_local, ln.beneficiary_id
+                    )
 
             # inserts
             for isin, p in incoming_by_isin.items():
@@ -431,9 +470,12 @@ def tr_resync_dryrun():
                         "units": p.get("units"),
                         "avg_price": p.get("avgPrice"),
                         "product_type": p.get("productType"),
+                        "beneficiary_id": None,  # par défaut: non assigné
                     })
-                    app.logger.info("[TR][resync][DRYRUN][INSERT] asset=%s isin=%s label=%s units=%s avg_price=%s type=%s",
-                                    a.id, isin, p.get("name"), p.get("units"), p.get("avgPrice"), p.get("productType"))
+                    app.logger.info(
+                        "[TR][resync][DRYRUN][INSERT] asset=%s isin=%s label=%s units=%s avg_price=%s type=%s",
+                        a.id, isin, p.get("name"), p.get("units"), p.get("avgPrice"), p.get("productType")
+                    )
 
             # cash diff
             old_cash = float(a.current_value) if a.current_value is not None else None
@@ -1665,6 +1707,7 @@ def tr_portfolio():
                     "name": p.get("name") or p.get("label"),
                     "units": _num(units),
                     "avgPrice": _num(avg),
+                    "productType": normalized_type,   # 👈 ajouté
                 })
 
             accounts.append({
