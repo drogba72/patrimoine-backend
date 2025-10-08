@@ -12,7 +12,7 @@ from models import (
     BrokerLink, AssetEvent, # ✅ ajout
 )
 
-
+import re
 from utils import amortization_monthly_payment
 from datetime import datetime, timedelta
 import traceback
@@ -89,6 +89,30 @@ try:
     _fernet = Fernet(_key.encode())  # ✅ toujours bytes
 except Exception as e:
     raise RuntimeError("BROKER_CRYPT_KEY must be a 32-byte urlsafe base64 key") from e
+
+def parse_date(val):
+    """
+    Accepte: '2025-09-16', '2025-09-16T08:22:22Z', '...+00:00', '...+0000'
+    Retourne date (UTC-agnostic).
+    """
+    try:
+        if not val:
+            return None
+        s = str(val).strip()
+        # Z -> +00:00
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        # +HHMM -> +HH:MM (ex: +0000 -> +00:00)
+        m = re.search(r"([+-]\d{2})(\d{2})$", s)
+        if m:
+            s = s[:m.start()] + f"{m.group(1)}:{m.group(2)}"
+        try:
+            return datetime.fromisoformat(s).date()
+        except Exception:
+            # dernier recours: juste YYYY-MM-DD
+            return datetime.fromisoformat(s[:10]).date()
+    except Exception:
+        return None
 
 def enc_secret(s: str) -> str:
     return _fernet.encrypt(s.encode()).decode("ascii")   # ✅ str
@@ -252,18 +276,54 @@ def upsert_produits_from_positions(session, positions):
 # app.py (ajoute près des routes TR)
 
 def _normalize_tr_accounts(raw):
-    """Reprend la logique de /broker/traderepublic/portfolio pour normaliser comptes & positions."""
+    """
+    Reprend la logique de /broker/traderepublic/portfolio pour normaliser comptes & positions.
+
+    Entrée attendue (exemples possibles côté TR) :
+    - raw["positions"] : liste de comptes { productType, cashAccountNumber, securitiesAccountNumber, positions:[...] }
+    - OU raw["accounts"] : même idée selon la source
+    - raw["transactions"] : utilisé pour déduire PEA/PER quand TR renvoie un type générique (ex: 'tax_wrapper')
+
+    Sortie :
+    {
+        "cash": {...} | None,
+        "accounts": [
+            {
+                "productType": "PEA" | "CTO" | "PER",
+                "cashAccountNumber": "...",
+                "securitiesAccountNumber": "...",
+                "positions": [
+                    {
+                        "isin": str | None,
+                        "name": str | None,
+                        "units": float | None,
+                        "avgPrice": float | None,
+                        "productType": "PEA" | "CTO" | "PER",
+                    },
+                    ...
+                ]
+            },
+            ...
+        ],
+        "positions_flat": [ ... même schéma qu'une position ... ]
+    }
+    """
+    # ---------- helpers ----------
     def _num(x):
         try:
             if x is None:
                 return None
             if isinstance(x, (int, float)):
                 return float(x)
+            # "28,116" → 28.116
             return float(str(x).replace(",", "."))
         except Exception:
             return None
 
     def _flatten_positions(lst):
+        """
+        Aplati une liste qui peut contenir des objets { positions:[...] } ou directement des positions.
+        """
         flat = []
         for it in lst or []:
             if isinstance(it, dict) and not it.get("isin") and isinstance(it.get("positions"), list):
@@ -272,35 +332,83 @@ def _normalize_tr_accounts(raw):
                 flat.append(it)
         return flat
 
-    # --------- 1) indices PEA/PER éventuels via historique (optionnel ici) ----------
-    hints = {}
-    for tx in raw.get("transactions", []) or []:
+    def _fallback_map_type(ptype_raw: str | None) -> str | None:
+        """
+        Mapping minimal si la fonction globale map_tr_product_type n'existe pas.
+        """
+        if not ptype_raw:
+            return None
+        p = ptype_raw.lower()
+        if "pea" in p:
+            return "PEA"
+        if "per" in p or "retire" in p or "pension" in p:
+            return "PER"
+        if "cto" in p or "broker" in p or "depot" in p or "depot" in p:
+            return "CTO"
+        if "tax_wrapper" in p:
+            return None  # on laissera les hints décider
+        # Valeur par défaut raisonnable
+        return "CTO"
+
+    def _map_type(ptype_raw):
+        # Si l'app définit déjà map_tr_product_type(...), on l'utilise.
+        mapper = globals().get("map_tr_product_type")
+        if callable(mapper):
+            return mapper(ptype_raw)
+        return _fallback_map_type(ptype_raw)
+
+    # ---------- 1) indices PEA/PER via historique (hints) ----------
+    hints: dict[str, str] = {}
+    for tx in (raw.get("transactions") or []):
         acc = (str(tx.get("cashAccountNumber") or "").strip())
-        evt = (tx.get("eventType") or "").lower()
-        sub = (tx.get("subtitle") or "").lower()
         if not acc:
             continue
+        evt = (tx.get("eventType") or "").lower()
+        sub = (tx.get("subtitle") or "").lower()
+        # Heuristiques simples
         if evt.startswith("pea_") or "pea" in sub:
             hints[acc] = "PEA"
         elif evt.startswith("per_") or "retirement" in sub or " per " in f" {sub} ":
             hints[acc] = "PER"
 
-    accounts = []
-    for acc in raw.get("accounts", []) or []:
-        cash_acc  = (acc.get("cashAccountNumber") or "").strip()
-        ptype_raw = (acc.get("productType") or "").lower()
-        normalized_type = hints.get(cash_acc) if "tax_wrapper" in ptype_raw else map_tr_product_type(ptype_raw) or "CTO"
+    # ---------- 2) source des "comptes" ----------
+    src_accounts = (raw.get("accounts") or raw.get("positions") or [])
 
+    accounts = []
+    for acc in src_accounts:
+        cash_acc  = (acc.get("cashAccountNumber") or "").strip()
+        sec_acc   = (acc.get("securitiesAccountNumber") or "").strip()
+        ptype_raw = (acc.get("productType") or "").lower()
+
+        # Si TR renvoie un type "générique" (ex: 'tax_wrapper'), on privilégie les hints.
+        if "tax_wrapper" in ptype_raw:
+            normalized_type = hints.get(cash_acc) or _map_type(ptype_raw) or "CTO"
+        else:
+            normalized_type = _map_type(ptype_raw) or "CTO"
+
+        # ---------- 3) positions normalisées ----------
         norm_positions = []
         for p in _flatten_positions(acc.get("positions")):
             if not (p.get("isin") or p.get("name") or p.get("label")):
                 continue
+
+            # avgPrice peut être 'averageBuyIn' (string/float) ou 'avgPrice' (float ou dict {value})
             avg = p.get("averageBuyIn")
-            if avg is None and isinstance(p.get("avgPrice"), dict):
-                avg = p["avgPrice"].get("value")
-            elif avg is None:
-                avg = p.get("avgPrice")
-            units = p.get("netSize") or p.get("virtualSize") or p.get("quantity") or p.get("units")
+            if avg is None:
+                ap = p.get("avgPrice")
+                if isinstance(ap, dict):
+                    avg = ap.get("value")
+                else:
+                    avg = ap
+
+            # units peut exister sous différents noms
+            units = (
+                p.get("netSize") or
+                p.get("virtualSize") or
+                p.get("quantity") or
+                p.get("units")
+            )
+
             norm_positions.append({
                 "isin": p.get("isin"),
                 "name": p.get("name") or p.get("label"),
@@ -310,15 +418,21 @@ def _normalize_tr_accounts(raw):
             })
 
         accounts.append({
-            "productType": normalized_type,  # PEA/CTO/...
+            "productType": normalized_type,
+            "cashAccountNumber": cash_acc or None,
+            "securitiesAccountNumber": sec_acc or None,
             "positions": norm_positions,
         })
+
+    # ---------- 4) sortie ----------
+    positions_flat = [pos for a in accounts for pos in a.get("positions", [])]
 
     return {
         "cash": raw.get("cash"),
         "accounts": accounts,
-        "positions_flat": [p for acc in accounts for p in acc["positions"]],
+        "positions_flat": positions_flat,
     }
+
 
 
 def _tr_tx_uid(tx: dict) -> str:
@@ -329,12 +443,32 @@ def _tr_tx_uid(tx: dict) -> str:
     return "tr:" + hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 def _map_tr_tx_to_event(tx: dict) -> dict:
-    t = (tx.get("type") or "").lower()
-    label = tx.get("label") or tx.get("name")
-    value_date = parse_date(tx.get("time") or tx.get("date"))
-    amount = parse_float(tx.get("amount"))
-    isin = (tx.get("isin") or "").strip().upper() or None
+    # 1) type / libellé / date
+    t = (tx.get("type") or tx.get("eventType") or "").lower()
+    label = tx.get("label") or tx.get("name") or tx.get("title")
+    value_date = (parse_date(tx.get("time") or tx.get("date") or tx.get("timestamp")))
+
+    # 2) montant (peut être un dict TR {value, currency,...})
+    raw_amount = tx.get("amount")
+    if isinstance(raw_amount, dict):
+        amount = parse_float(raw_amount.get("value"))
+    else:
+        amount = parse_float(raw_amount)
+
+    # 3) quantité si dispo (souvent absente dans la timeline “compacte”)
     quantity = parse_float(tx.get("quantity"))
+
+    # 4) ISIN : direct ou à partir de l’asset d’icône (logos/ISIN/v2)
+    isin = (tx.get("isin") or "").strip().upper() or None
+    if not isin:
+        for k in ("icon", "avatar"):
+            v = tx.get(k) or {}
+            asset = v.get("asset") if isinstance(v, dict) else None
+            if asset:
+                m = re.search(r"logos/([A-Z0-9]{12})/", asset)
+                if m:
+                    isin = m.group(1)
+                    break
 
     ev = {
         "kind": "other",
@@ -345,13 +479,14 @@ def _map_tr_tx_to_event(tx: dict) -> dict:
         "unit_price": None,
         "isin": isin,
         "note": label,
-        "tx_type": None,  # buy / sell / dividend pour la table miroir
+        "tx_type": None,
     }
 
+    # 5) catégorisation
     if t in TR_EXEC_TYPES:
         ev["kind"] = "portfolio_trade"
-        ev["quantity"] = quantity
-        ev["unit_price"] = (abs(amount)/quantity) if (amount is not None and quantity) else None
+        ev["quantity"] = quantity  # peut rester None si non fourni
+        ev["unit_price"] = (abs(amount) / quantity) if (amount is not None and quantity) else None
         ev["tx_type"] = "buy" if (amount or 0) < 0 else "sell"
     elif t in TR_DIV_TYPES:
         ev["kind"] = "dividend"
@@ -364,6 +499,7 @@ def _map_tr_tx_to_event(tx: dict) -> dict:
         ev["kind"] = "cash_op"; ev["category"] = "deposit"
     elif t in TR_PAYIN_TYPES:
         ev["kind"] = "cash_op"; ev["category"] = "pay_in"
+
     return ev
 
 def upsert_tr_asset_events(session, user_id: int, asset: Asset, tr_transactions: list) -> dict:
