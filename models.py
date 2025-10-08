@@ -49,6 +49,7 @@ class Asset(Base):
     label = Column(String(255), nullable=False)
     current_value = Column(Numeric(14, 2))
     created_at = Column(DateTime, default=datetime.utcnow)
+    solde_initial = Column(String(255), nullable=True)
 
     beneficiary_id = Column(Integer, ForeignKey("beneficiaries.id", ondelete="SET NULL"), nullable=True)
 

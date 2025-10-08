@@ -492,13 +492,13 @@ def _map_tr_tx_to_event(tx: dict) -> dict:
         ev["kind"] = "dividend"
         ev["tx_type"] = "dividend"
     elif t in TR_INTEREST_TYPES:
-        ev["kind"] = "cash_op"; ev["category"] = "interest"
+        ev["kind"] = "portfolio_trade"; ev["category"] = "interest"
     elif t in TR_FEE_TYPES:
-        ev["kind"] = "cash_op"; ev["category"] = "fee"
+        ev["kind"] = "portfolio_trade"; ev["category"] = "fee"
     elif t in TR_DEPOSIT_TYPES:
-        ev["kind"] = "cash_op"; ev["category"] = "deposit"
+        ev["kind"] = "portfolio_trade"; ev["category"] = "deposit"
     elif t in TR_PAYIN_TYPES:
-        ev["kind"] = "cash_op"; ev["category"] = "pay_in"
+        ev["kind"] = "portfolio_trade"; ev["category"] = "pay_in"
 
     return ev
 
@@ -628,6 +628,7 @@ def tr_resync_dryrun():
     list_only = bool(data.get("list_only"))
     apply = data.get("apply") or {}
     apply_tx = bool(apply.get("transactions"))  # 👈 n'appliquer que les transactions
+    apply_cash = bool(apply.get("cash"))   # 👈 nouveau
 
     s = Session()
     try:
@@ -677,6 +678,13 @@ def tr_resync_dryrun():
         # 3) Avec token -> fetch + normalisation
         raw = tr_fetch_api(token)
         norm = _normalize_tr_accounts(raw)
+        new_cash_raw = norm.get("cash")
+        # TR renvoie parfois un dict {value, currency}. On sécurise :
+        if isinstance(new_cash_raw, dict):
+            new_cash = parse_float(new_cash_raw.get("value"))
+        else:
+            new_cash = parse_float(new_cash_raw)
+
         new_cash = norm.get("cash")
         new_positions = norm.get("positions_flat")  # [{isin, name, units, avgPrice, productType}]
         tr_txs = raw.get("transactions") or []
@@ -803,6 +811,26 @@ def tr_resync_dryrun():
         else:
             app.logger.info("🧪 [TR][DRYRUN] Transactions détectées: %d (aucune écriture)", tx_total_tr)
 
+        cash_update = {"applied": False, "updated_assets": [], "new_value": new_cash}
+
+        if apply_cash:
+            if new_cash is None:
+                return jsonify({"ok": False, "error": "Cash TR manquant/illisible"}), 400
+
+            if not portfolios:
+                return jsonify({"ok": False, "error": "Aucun portefeuille Trade Republic ciblé."}), 400
+
+            for a in portfolios:
+                # ici on choisit de poser le cash TR sur assets.current_value
+                a.current_value = new_cash
+                cash_update["updated_assets"].append(a.id)
+
+            s.commit()
+            cash_update["applied"] = True
+        else:
+            app.logger.info("🧪 [TR][DRYRUN] Cash détecté: %s (aucune écriture)", new_cash)
+
+
         # Vue compacte BDD pour retour
         db_compact = [{
             "asset_id": a.id,
@@ -815,7 +843,7 @@ def tr_resync_dryrun():
         return jsonify({
             "ok": True,
             "mode": "dry_run_except_transactions" if apply_tx else "dry_run",
-            "apply": {"transactions": apply_tx},
+            "apply": {"transactions": apply_tx, "cash": apply_cash},     # 👈
             "tr": {
                 "cash": new_cash,
                 "positions_total": len(new_positions or []),
@@ -823,8 +851,10 @@ def tr_resync_dryrun():
             },
             "db": {"portfolios": db_compact},
             "diff": diff_summary,
-            "tx_upsert_stats": tx_stats_global if apply_tx else None
+            "tx_upsert_stats": tx_stats_global if apply_tx else None,
+            "cash_update": cash_update                                     # 👈
         }), 200
+
 
     except Exception as e:
         app.logger.exception("[TR][resync] failed")
