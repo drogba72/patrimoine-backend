@@ -310,6 +310,46 @@ def _normalize_tr_accounts(raw):
         "positions_flat": [p for acc in accounts for p in acc["positions"]],
     }
 
+@app.route("/api/portfolios/<int:asset_id>/transactions", methods=["GET"])
+@jwt_required()
+def list_portfolio_transactions(asset_id):
+    """Retourne les transactions d'un portefeuille (par asset_id)."""
+    uid = int(get_jwt_identity())
+    s = Session()
+    try:
+        a = (
+            s.query(Asset)
+            .options(
+                joinedload(Asset.portfolio)
+                .joinedload(AssetPortfolio.transactions)
+            )
+            .filter(Asset.id == asset_id, Asset.user_id == uid, Asset.type == "portfolio")
+            .first()
+        )
+        if not a or not a.portfolio:
+            return jsonify({"error": "Portfolio introuvable"}), 404
+
+        txs = sorted(
+            a.portfolio.transactions or [],
+            key=lambda t: (t.date.isoformat() if t.date else "")
+        )
+        out = [{
+            "id": t.id,
+            "date": t.date.isoformat() if t.date else None,
+            "transaction_type": t.transaction_type,
+            "isin": t.isin,
+            "label": t.label,
+            "quantity": float(t.quantity) if t.quantity is not None else None,
+            "amount": float(t.amount) if t.amount is not None else None,
+        } for t in txs]
+
+        return jsonify(out), 200
+    except Exception as e:
+        app.logger.exception("[PORTFOLIO TX] error")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        s.close()
+
 
 @app.route("/api/broker/traderepublic/resync", methods=["POST"])
 @jwt_required()
