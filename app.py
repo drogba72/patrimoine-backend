@@ -8,8 +8,7 @@ from dotenv import load_dotenv
 from models import (
     Base, User, Beneficiary, Asset, AssetLivret, AssetImmo, AssetPortfolio, PortfolioLine,
     AssetOther, UserIncome, UserExpense, PortfolioProduct, ImmoLoan, ImmoExpense,
-    ProduitInvest, ProduitHisto, ProduitIndicateurs, ProduitIntraday, PortfolioTransaction,
-    BrokerLink, AssetEvent, # ✅ ajout
+    ProduitInvest, ProduitHisto, ProduitIndicateurs, ProduitIntraday, BrokerLink, AssetEvent, # ✅ ajout
 )
 
 import re
@@ -507,8 +506,11 @@ def _map_tr_tx_to_event(tx: dict) -> dict:
     return ev
 
 def upsert_tr_asset_events(session, user_id: int, asset: Asset, tr_transactions: list) -> dict:
-    pf = session.query(AssetPortfolio).filter_by(asset_id=asset.id).first()
-    created = updated = linked = 0
+    """
+    Idempotent: insère/MAJ uniquement dans AssetEvent (status=posted).
+    Ne crée plus de PortfolioTransaction et ne renseigne plus posted_entity_*.
+    """
+    created = updated = 0
 
     for tx in (tr_transactions or []):
         uid = _tr_tx_uid(tx)
@@ -534,7 +536,6 @@ def upsert_tr_asset_events(session, user_id: int, asset: Asset, tr_transactions:
             if changed:
                 existing.data = {**(existing.data or {}), "tr_raw": tx, "tr_type": tx.get("type"), "tr_uid": uid}
                 updated += 1
-            ev = existing
         else:
             ev = AssetEvent(
                 user_id=user_id, asset_id=asset.id, status="posted",
@@ -544,75 +545,38 @@ def upsert_tr_asset_events(session, user_id: int, asset: Asset, tr_transactions:
                 category=mapped["category"], note=mapped["note"],
                 data={"tr_uid": uid, "tr_type": tx.get("type"), "tr_raw": tx}
             )
-            session.add(ev); session.flush()
+            session.add(ev)
             created += 1
 
-        # miroir portfolio_transactions pour trades/dividendes (même logique que POST /api/events)
-        if pf and ev.kind in ("portfolio_trade","dividend"):
-            if not ev.posted_entity_id:
-                tx_row = PortfolioTransaction(
-                    portfolio_id=pf.id,
-                    isin=ev.isin,
-                    label=ev.note,
-                    transaction_type=mapped["tx_type"],
-                    quantity=ev.quantity if ev.kind == "portfolio_trade" else None,
-                    amount=ev.amount,
-                    date=ev.value_date
-                )
-                session.add(tx_row); session.flush()
-                ev.posted_entity_type = "portfolio_transaction"
-                ev.posted_entity_id = tx_row.id
-                linked += 1
-            else:
-                pt = session.query(PortfolioTransaction).get(ev.posted_entity_id)
-                if pt:
-                    pt.transaction_type = mapped["tx_type"] or pt.transaction_type
-                    pt.quantity = ev.quantity if ev.kind == "portfolio_trade" else pt.quantity
-                    pt.amount = ev.amount
-                    pt.date = ev.value_date
-
     session.commit()
-    return {"created": created, "updated": updated, "linked": linked}
+    return {"created": created, "updated": updated}
 
-@app.route("/api/portfolios/<int:asset_id>/transactions", methods=["GET"])
-@jwt_required()
-def list_portfolio_transactions(asset_id):
-    """Retourne les transactions d'un portefeuille (par asset_id)."""
-    uid = int(get_jwt_identity())
-    s = Session()
-    try:
-        a = (
-            s.query(Asset)
-            .options(
-                joinedload(Asset.portfolio)
-                .joinedload(AssetPortfolio.transactions)
-            )
-            .filter(Asset.id == asset_id, Asset.user_id == uid, Asset.type == "portfolio")
-            .first()
-        )
-        if not a or not a.portfolio:
-            return jsonify({"error": "Portfolio introuvable"}), 404
+def _events_to_tx_view(session, uid: int, asset_id: int) -> list[dict]:
+    evs = (session.query(AssetEvent)
+           .filter(AssetEvent.user_id == uid,
+                   AssetEvent.asset_id == asset_id,
+                   AssetEvent.status == "posted",
+                   AssetEvent.kind.in_(["portfolio_trade","dividend"]))
+           .order_by(AssetEvent.value_date.asc(), AssetEvent.id.asc())
+           .all())
 
-        txs = sorted(
-            a.portfolio.transactions or [],
-            key=lambda t: (t.date.isoformat() if t.date else "")
-        )
-        out = [{
-            "id": t.id,
-            "date": t.date.isoformat() if t.date else None,
-            "transaction_type": t.transaction_type,
-            "isin": t.isin,
-            "label": t.label,
-            "quantity": float(t.quantity) if t.quantity is not None else None,
-            "amount": float(t.amount) if t.amount is not None else None,
-        } for t in txs]
-
-        return jsonify(out), 200
-    except Exception as e:
-        app.logger.exception("[PORTFOLIO TX] error")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        s.close()
+    out = []
+    for e in evs:
+        if e.kind == "dividend":
+            tx_type = "dividend"; qty = None
+        else:
+            tx_type = "buy" if (e.quantity or 0) > 0 else "sell"
+            qty = float(e.quantity) if e.quantity is not None else None
+        out.append({
+            "id": e.id,
+            "date": e.value_date.isoformat(),
+            "transaction_type": tx_type,
+            "isin": e.isin,
+            "label": e.note,
+            "quantity": qty,
+            "amount": float(e.amount) if e.amount is not None else None,
+        })
+    return out
 
 
 @app.route("/api/broker/traderepublic/resync", methods=["POST"])
@@ -697,8 +661,6 @@ def tr_resync_dryrun():
                     .joinedload(PortfolioLine.product),
                 joinedload(Asset.portfolio)
                     .joinedload(AssetPortfolio.products),
-                joinedload(Asset.portfolio)
-                    .joinedload(AssetPortfolio.transactions)
             )
             .join(AssetPortfolio, AssetPortfolio.asset_id == Asset.id)
             .filter(Asset.user_id == uid, Asset.type == "portfolio",
@@ -731,42 +693,43 @@ def tr_resync_dryrun():
                         return pp.product_type
                 return None
 
-            db_portfolios = []
-            for a in portfolios:
-                pf = a.portfolio
-                db_portfolios.append({
-                    "asset_id": a.id,
-                    "asset_label": a.label,
-                    "broker": pf.broker,
-                    "products": [{"id": pp.id, "product_type": pp.product_type} for pp in (pf.products or [])],
-                    "lines": [{
-                        "id": ln.id,
-                        "isin": ln.isin,
-                        "label": ln.label,
-                        "units": float(ln.units) if ln.units is not None else None,
-                        "avg_price": float(ln.avg_price) if ln.avg_price is not None else None,
-                        "product_type": _pt_for_line(pf, ln),
-                        "beneficiary_id": ln.beneficiary_id,
-                    } for ln in (pf.lines or [])],
-                    "transactions": [{
-                        "id": tx.id,
-                        "date": tx.date.isoformat(),
-                        "transaction_type": tx.transaction_type,
-                        "isin": tx.isin,
-                        "label": tx.label,
-                        "quantity": float(tx.quantity) if tx.quantity is not None else None,
-                        "amount": float(tx.amount) if tx.amount is not None else None,
-                    } for tx in (pf.transactions or [])],
-                })
+            db_portfolios.append({
+                "asset_id": a.id,
+                "asset_label": a.label,
+                "broker": pf.broker,
+                "products": [{"id": pp.id, "product_type": pp.product_type} for pp in (pf.products or [])],
+                "lines": [{
+                    "id": ln.id,
+                    "isin": ln.isin,
+                    "label": ln.label,
+                    "units": float(ln.units) if ln.units is not None else None,
+                    "avg_price": float(ln.avg_price) if ln.avg_price is not None else None,
+                    "product_type": _pt_for_line(pf, ln),
+                    "beneficiary_id": ln.beneficiary_id,
+                } for ln in (pf.lines or [])],
+                # ✅ transactions = projection des AssetEvent
+                "transactions": _events_to_tx_view(s, uid, a.id),
+            })
+
 
             try:
                 app.logger.info("📦 [TR][LIST] GLOBAL = %s", json.dumps(tr_summary, ensure_ascii=False, indent=2)[:80000])
-                compact = [{"asset_id": d["asset_id"],
-                            "asset_label": d["asset_label"],
-                            "products": d["products"],
-                            "lines_count": len(d["lines"]),
-                            "transactions_count": len(d["transactions"])} for d in db_portfolios]
-                app.logger.info("🗄️ [DB][LIST] PORTFOLIOS = %s", json.dumps(compact, ensure_ascii=False, indent=2)[:80000])
+                # dans list_only (pour compact)
+                compact = []
+                for d in db_portfolios:
+                    tx_count = (s.query(func.count(AssetEvent.id))
+                                .filter(AssetEvent.user_id == uid,
+                                        AssetEvent.asset_id == d["asset_id"],
+                                        AssetEvent.status == "posted",
+                                        AssetEvent.kind.in_(["portfolio_trade","dividend"]))
+                                .scalar() or 0)
+                    compact.append({
+                        "asset_id": d["asset_id"],
+                        "asset_label": d["asset_label"],
+                        "products": d["products"],
+                        "lines_count": len(d["lines"]),
+                        "transactions_count": int(tx_count),
+                    })
             except Exception:
                 pass
 
@@ -826,13 +789,21 @@ def tr_resync_dryrun():
 
 
         # Vue compacte BDD pour retour
-        db_compact = [{
-            "asset_id": a.id,
-            "asset_label": a.label,
-            "broker": a.portfolio.broker,
-            "lines_count": len(a.portfolio.lines or []),
-            "transactions_count": len(a.portfolio.transactions or [])
-        } for a in portfolios]
+        db_compact = []
+        for a in portfolios:
+            tx_count = (s.query(func.count(AssetEvent.id))
+                        .filter(AssetEvent.user_id == uid,
+                                AssetEvent.asset_id == a.id,
+                                AssetEvent.status == "posted",
+                                AssetEvent.kind.in_(["portfolio_trade","dividend"]))
+                        .scalar() or 0)
+            db_compact.append({
+                "asset_id": a.id,
+                "asset_label": a.label,
+                "broker": a.portfolio.broker,
+                "lines_count": len(a.portfolio.lines or []),
+                "transactions_count": int(tx_count),
+            })
 
         return jsonify({
             "ok": True,
@@ -2134,18 +2105,6 @@ def tr_import():
             )
             session.add(pl)
 
-        # 2) Transactions TR (inchangé si tu veux)
-        for tx in transactions:
-            session.add(PortfolioTransaction(
-                portfolio_id=pf.id,
-                isin=tx.get("isin"),
-                label=tx.get("label") or tx.get("name"),
-                transaction_type=tx.get("transaction_type") or tx.get("type"),
-                quantity=parse_float(tx.get("quantity")),
-                amount=parse_float(tx.get("amount")),
-                date=parse_date(tx.get("date"))
-            ))
-
         session.flush()
 
         # 3) Allocations utilisateur -> compléter les lignes existantes
@@ -2181,123 +2140,6 @@ def tr_import():
 # ---------------------------------------------------------
 # Portfolio Transactions
 # ---------------------------------------------------------
-
-@app.route("/api/assets/<int:asset_id>/transactionsX", methods=["GET"], endpoint="list_portfolio_transactions_by_asset")
-@jwt_required()
-def list_portfolio_transactions_by_asset(asset_id):
-    user_id = int(get_jwt_identity())
-    session = Session()
-    try:
-        # sécurité : vérifier que le portfolio appartient bien au user
-        pf = (session.query(AssetPortfolio)
-              .join(Asset)
-              .filter(AssetPortfolio.id == portfolio_id, Asset.user_id == user_id)
-              .first())
-        if not pf:
-            return jsonify({"error": "Portfolio introuvable"}), 404
-
-        txs = pf.transactions
-        return jsonify([{
-            "id": tx.id,
-            "isin": tx.isin,
-            "label": tx.label,
-            "transaction_type": tx.transaction_type,
-            "quantity": float(tx.quantity) if tx.quantity else None,
-            "amount": float(tx.amount) if tx.amount else None,
-            "date": tx.date.isoformat()
-        } for tx in txs]), 200
-    finally:
-        session.close()
-
-
-@app.route("/api/portfolios/<int:portfolio_id>/transactions", methods=["POST"])
-@jwt_required()
-def add_portfolio_transaction(portfolio_id):
-    user_id = int(get_jwt_identity())
-    data = request.get_json() or {}
-    session = Session()
-    try:
-        pf = (session.query(AssetPortfolio)
-              .join(Asset)
-              .filter(AssetPortfolio.id == portfolio_id, Asset.user_id == user_id)
-              .first())
-        if not pf:
-            return jsonify({"error": "Portfolio introuvable"}), 404
-
-        tx = PortfolioTransaction(
-            portfolio_id=portfolio_id,
-            isin=data.get("isin"),
-            label=data.get("label"),
-            transaction_type=data.get("transaction_type"),
-            quantity=parse_float(data.get("quantity")),
-            amount=parse_float(data.get("amount")),
-            date=parse_date(data.get("date"))
-        )
-        session.add(tx)
-        session.commit()
-        return jsonify({"ok": True, "id": tx.id}), 201
-    except Exception as e:
-        session.rollback()
-        return jsonify({"error": str(e)}), 500
-    finally:
-        session.close()
-
-
-@app.route("/api/transactions/<int:tx_id>", methods=["PUT"])
-@jwt_required()
-def update_portfolio_transaction(tx_id):
-    user_id = int(get_jwt_identity())
-    data = request.get_json() or {}
-    session = Session()
-    try:
-        tx = (session.query(PortfolioTransaction)
-              .join(AssetPortfolio)
-              .join(Asset)
-              .filter(PortfolioTransaction.id == tx_id, Asset.user_id == user_id)
-              .first())
-        if not tx:
-            return jsonify({"error": "Transaction introuvable"}), 404
-
-        for key in ["isin", "label", "transaction_type"]:
-            if key in data:
-                setattr(tx, key, data[key])
-        if "quantity" in data:
-            tx.quantity = parse_float(data["quantity"])
-        if "amount" in data:
-            tx.amount = parse_float(data["amount"])
-        if "date" in data:
-            tx.date = parse_date(data["date"])
-
-        session.commit()
-        return jsonify({"ok": True}), 200
-    except Exception as e:
-        session.rollback()
-        return jsonify({"error": str(e)}), 500
-    finally:
-        session.close()
-
-
-@app.route("/api/transactions/<int:tx_id>", methods=["DELETE"])
-@jwt_required()
-def delete_portfolio_transaction(tx_id):
-    user_id = int(get_jwt_identity())
-    session = Session()
-    try:
-        tx = (session.query(PortfolioTransaction)
-              .join(AssetPortfolio)
-              .join(Asset)
-              .filter(PortfolioTransaction.id == tx_id, Asset.user_id == user_id)
-              .first())
-        if not tx:
-            return jsonify({"error": "Transaction introuvable"}), 404
-        session.delete(tx)
-        session.commit()
-        return jsonify({"ok": True, "deleted_id": tx_id}), 200
-    except Exception as e:
-        session.rollback()
-        return jsonify({"error": str(e)}), 500
-    finally:
-        session.close()
 
 @app.route("/api/broker/traderepublic/link", methods=["GET"])
 @jwt_required()
@@ -2473,27 +2315,6 @@ def create_event():
 
         session.add(ev)
         session.flush()
-
-        # Effets côté portefeuille (facultatif, utile si status=posted)
-        if status == "posted" and asset.type == "portfolio" and kind in ("portfolio_trade", "dividend"):
-            pf = session.query(AssetPortfolio).filter_by(asset_id=asset.id).first()
-            if pf:
-                if kind == "portfolio_trade":
-                    tx_type = "buy" if (quantity or 0) > 0 else "sell"
-                else:
-                    tx_type = "dividend"
-                tx = PortfolioTransaction(
-                    portfolio_id=pf.id,
-                    isin=isin,
-                    label=data.get("label") or note,
-                    transaction_type=tx_type,
-                    quantity=quantity if kind == "portfolio_trade" else None,
-                    amount=amount,
-                    date=value_date
-                )
-                session.add(tx); session.flush()
-                ev.posted_entity_type = "portfolio_transaction"
-                ev.posted_entity_id   = tx.id
 
         session.commit()
         return jsonify({"ok": True, "id": ev.id}), 201
