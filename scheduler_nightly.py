@@ -17,6 +17,40 @@ TZ = ZoneInfo("Europe/Paris")
 
 def last_day(y, m): return calendar.monthrange(y, m)[1]
 
+def add_months_year_month(y: int, m: int, delta: int) -> tuple[int, int]:
+    total = (y * 12 + (m - 1)) + delta
+    ny, nm = divmod(total, 12)
+    return ny, nm + 1  # month 1..12
+
+def due_from_anchor(anchor: date, k_months: int, wanted_day: int) -> date:
+    y, m = add_months_year_month(anchor.year, anchor.month, k_months)
+    d = min(wanted_day or 1, last_day(y, m))  # règle "dernier jour"
+    return date(y, m, d)
+
+def iter_due_dates(rec_freq: str, wanted_day: int, anchor: date, start_date: date, end_date: date):
+    """Génère toutes les échéances (incluses) alignées sur 'anchor' et comprises entre start_date et end_date."""
+    step = {"mensuel": 1, "trimestriel": 3, "annuel": 12}.get((rec_freq or "").lower())
+    if not step:
+        return
+    # Aligner le premier mois sur la phase ancrée
+    months_delta = (start_date.year - anchor.year) * 12 + (start_date.month - anchor.month)
+    if months_delta < 0:
+        k = 0
+    else:
+        k = months_delta - (months_delta % step)  # ramener au bloc (mensuel/trimestriel/annuel)
+    # Trouver la première échéance >= start_date
+    while True:
+        d = due_from_anchor(anchor, k, wanted_day)
+        if d >= start_date:
+            break
+        k += step
+    # Itérer jusqu'à end_date
+    while d <= end_date:
+        yield d
+        k += step
+        d = due_from_anchor(anchor, k, wanted_day)
+
+
 def is_due_today_monthly(day_wanted: int, today: date) -> bool:
     # Jours > fin de mois -> déclenche au dernier jour
     d = min(day_wanted or 1, last_day(today.year, today.month))
@@ -87,7 +121,7 @@ def run_for_day(run_date: date, verbose: bool = False):
     s = Session()
     run = {"inserted": 0, "skipped": 0, "details": []}  # <= détails ajoutés
     try:
-        # --- DCA LIVRETS ---
+        # --- DCA LIVRETS (avec backfill) ---
         rows = (s.query(Asset, AssetLivret)
                 .join(AssetLivret, AssetLivret.asset_id == Asset.id)
                 .filter(
@@ -96,47 +130,64 @@ def run_for_day(run_date: date, verbose: bool = False):
                 ).all())
 
         for asset, lv in rows:
+            freq = (lv.recurring_frequency or "").lower()
+            if freq not in ("mensuel", "trimestriel", "annuel"):
+                continue
+
+            # Ancre : dernier auto_dca sinon date de création de l'asset
             last_auto = (s.query(AssetEvent)
-                        .filter(AssetEvent.asset_id == asset.id,
-                                AssetEvent.data['origin'].astext == 'auto_dca')
-                        .order_by(AssetEvent.value_date.desc())
-                        .first())
+                         .filter(AssetEvent.asset_id == asset.id,
+                                 AssetEvent.data['origin'].astext == 'auto_dca')
+                         .order_by(AssetEvent.value_date.desc())
+                         .first())
 
             anchor = (last_auto.value_date if last_auto
                       else (asset.created_at.date() if asset.created_at else run_date))
 
-            if is_due_today_frequency(lv.recurring_frequency, lv.recurring_day, run_date, anchor=anchor):
-                existing = find_existing(s, asset.id, "auto_dca", run_date)
+            # On backfill de max(anchor, asset.created_at) jusqu'à run_date
+            start = max(anchor, (asset.created_at.date() if asset.created_at else anchor))
+
+            for due_dt in iter_due_dates(freq, lv.recurring_day, anchor=anchor,
+                                         start_date=start, end_date=run_date):
+                # idempotent : existe déjà ?
+                existing = find_existing(s, asset.id, "auto_dca", due_dt)
+                period = due_dt.strftime("%Y-%m")
+
                 if existing:
                     run["skipped"] += 1
-                    item = {
+                    run["details"].append({
                         "scope": "livret",
                         "reason": "already_exists_auto_dca",
                         "asset_id": asset.id,
                         "asset_label": asset.label,
-                        "value_date": run_date.isoformat(),
-                        "period": run_date.strftime("%Y-%m"),
+                        "value_date": due_dt.isoformat(),
+                        "period": period,
                         "event_id": existing.id
-                    }
-                    run["details"].append(item)
-                    if verbose:
-                        print("SKIP:", item)
+                    })
                     continue
 
                 data = {
-                    "origin":"auto_dca",
-                    "frequency": (lv.recurring_frequency or "").lower(),
+                    "origin": "auto_dca",
+                    "frequency": freq,
                     "expected_day": lv.recurring_day,
-                    "period": run_date.strftime("%Y-%m"),
+                    "period": period,
                 }
                 insert_cash_op(
-                    s, asset.user_id, asset.id, run_date,
+                    s, asset.user_id, asset.id, due_dt,
                     float(lv.recurring_amount),
                     note=f"DCA automatique Livret ({lv.bank or asset.label})",
                     category="dca",
                     data=data
                 )
                 run["inserted"] += 1
+                run["details"].append({
+                    "scope": "livret",
+                    "reason": "inserted_auto_dca",
+                    "asset_id": asset.id,
+                    "asset_label": asset.label,
+                    "value_date": due_dt.isoformat(),
+                    "period": period
+                })
 
         # --- ÉCHÉANCES PRETS ---
         loans = (s.query(ImmoLoan, AssetImmo, Asset)
