@@ -693,23 +693,26 @@ def tr_resync_dryrun():
                         return pp.product_type
                 return None
 
-            db_portfolios.append({
-                "asset_id": a.id,
-                "asset_label": a.label,
-                "broker": pf.broker,
-                "products": [{"id": pp.id, "product_type": pp.product_type} for pp in (pf.products or [])],
-                "lines": [{
-                    "id": ln.id,
-                    "isin": ln.isin,
-                    "label": ln.label,
-                    "units": float(ln.units) if ln.units is not None else None,
-                    "avg_price": float(ln.avg_price) if ln.avg_price is not None else None,
-                    "product_type": _pt_for_line(pf, ln),
-                    "beneficiary_id": ln.beneficiary_id,
-                } for ln in (pf.lines or [])],
-                # ✅ transactions = projection des AssetEvent
-                "transactions": _events_to_tx_view(s, uid, a.id),
-            })
+            db_portfolios = []
+            for a in portfolios:
+                pf = a.portfolio
+                db_portfolios.append({
+                    "asset_id": a.id,
+                    "asset_label": a.label,
+                    "broker": pf.broker,
+                    "products": [{"id": pp.id, "product_type": pp.product_type} for pp in (pf.products or [])],
+                    "lines": [{
+                        "id": ln.id,
+                        "isin": ln.isin,
+                        "label": ln.label,
+                        "units": float(ln.units) if ln.units is not None else None,
+                        "avg_price": float(ln.avg_price) if ln.avg_price is not None else None,
+                        "product_type": _pt_for_line(pf, ln),
+                        "beneficiary_id": ln.beneficiary_id,
+                    } for ln in (pf.lines or [])],
+                    # ✅ transactions = projection des AssetEvent
+                    "transactions": _events_to_tx_view(s, uid, a.id),
+                })
 
 
             try:
@@ -857,7 +860,7 @@ def serialize_asset(asset: Asset, session) -> dict:
                         AssetEvent.user_id == asset.user_id,
                         AssetEvent.asset_id == asset.id,
                         AssetEvent.status == "posted",
-                        AssetEvent.kind.in_(["cash_op", "transfer"]),
+                        AssetEvent.kind.in_(["transfer"]),
                         AssetEvent.value_date <= today
                     ).scalar() or 0.0)
            effective = (lv.balance or 0.0) + float(delta)
