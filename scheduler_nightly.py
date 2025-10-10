@@ -6,6 +6,7 @@ from sqlalchemy import text as sqltext
 from sqlalchemy.orm import sessionmaker
 from models import Asset, AssetLivret, AssetImmo, ImmoLoan, AssetEvent  # réutilise tes models
 from zoneinfo import ZoneInfo
+import json
 
 DB_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
@@ -82,9 +83,9 @@ def insert_transfer_pair(session, user_id:int, src_asset_id:int, dst_asset_id:in
     session.add_all([debit, credit])
     return debit, credit
 
-def run_for_day(run_date: date):
+def run_for_day(run_date: date, verbose: bool = False):
     s = Session()
-    run = {"inserted": 0, "skipped": 0}
+    run = {"inserted": 0, "skipped": 0, "details": []}  # <= détails ajoutés
     try:
         # --- DCA LIVRETS ---
         rows = (s.query(Asset, AssetLivret)
@@ -95,7 +96,6 @@ def run_for_day(run_date: date):
                 ).all())
 
         for asset, lv in rows:
-            # Chercher la dernière exécution auto_dca pour ancrer la phase
             last_auto = (s.query(AssetEvent)
                         .filter(AssetEvent.asset_id == asset.id,
                                 AssetEvent.data['origin'].astext == 'auto_dca')
@@ -103,13 +103,26 @@ def run_for_day(run_date: date):
                         .first())
 
             anchor = (last_auto.value_date if last_auto
-                    else (asset.created_at.date() if asset.created_at else run_date))
+                      else (asset.created_at.date() if asset.created_at else run_date))
 
             if is_due_today_frequency(lv.recurring_frequency, lv.recurring_day, run_date, anchor=anchor):
-                # idempotent (par jour + asset + origin)
-                if find_existing(s, asset.id, "auto_dca", run_date):
+                existing = find_existing(s, asset.id, "auto_dca", run_date)
+                if existing:
                     run["skipped"] += 1
+                    item = {
+                        "scope": "livret",
+                        "reason": "already_exists_auto_dca",
+                        "asset_id": asset.id,
+                        "asset_label": asset.label,
+                        "value_date": run_date.isoformat(),
+                        "period": run_date.strftime("%Y-%m"),
+                        "event_id": existing.id
+                    }
+                    run["details"].append(item)
+                    if verbose:
+                        print("SKIP:", item)
                     continue
+
                 data = {
                     "origin":"auto_dca",
                     "frequency": (lv.recurring_frequency or "").lower(),
@@ -118,7 +131,7 @@ def run_for_day(run_date: date):
                 }
                 insert_cash_op(
                     s, asset.user_id, asset.id, run_date,
-                    float(lv.recurring_amount), 
+                    float(lv.recurring_amount),
                     note=f"DCA automatique Livret ({lv.bank or asset.label})",
                     category="dca",
                     data=data
@@ -135,11 +148,9 @@ def run_for_day(run_date: date):
                  .all())
 
         for loan, immo, asset in loans:
-            # échéance du mois ?
             if not is_due_today_monthly(loan.loan_start_date.day, run_date):
                 continue
 
-            # période & borne fin
             months_from_start = (run_date.year - loan.loan_start_date.year)*12 + (run_date.month - loan.loan_start_date.month)
             if months_from_start < 0 or months_from_start >= (loan.loan_duration_months or 0):
                 continue
@@ -156,6 +167,19 @@ def run_for_day(run_date: date):
                       .first())
             if exists:
                 run["skipped"] += 1
+                item = {
+                    "scope": "immo_loan",
+                    "reason": "already_exists_auto_loan",
+                    "asset_id": asset.id,
+                    "asset_label": asset.label,
+                    "loan_id": loan.id,
+                    "value_date": run_date.isoformat(),
+                    "period": period,
+                    "event_id": exists.id
+                }
+                run["details"].append(item)
+                if verbose:
+                    print("SKIP:", item)
                 continue
 
             data = {
@@ -165,7 +189,6 @@ def run_for_day(run_date: date):
             }
             note = f"Échéance prêt immo (#{loan.id})"
 
-            # Transfer si une source est définie
             if getattr(loan, "pay_from_asset_id", None):
                 insert_transfer_pair(
                     s, asset.user_id,
@@ -196,11 +219,12 @@ def run_for_day(run_date: date):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", help="YYYY-MM-DD (par défaut: aujourd'hui Europe/Paris)")
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     today = datetime.now(TZ).date() if not args.date else date.fromisoformat(args.date)
 
-    # 1) ouvrir un run "running" AVANT le traitement
+    # 1) job_runs: running
     s = Session()
     try:
         run_id = s.execute(
@@ -218,10 +242,17 @@ def main():
     finally:
         s.close()
 
-    ok, stats = run_for_day(today)
+    # 2) run
+    ok, stats = run_for_day(today, verbose=args.verbose)
 
+    # 3) job_runs: finalize (message = JSON tronqué)
     s = Session()
     try:
+        msg_obj = {"stats": {"inserted": stats.get("inserted", 0),
+                             "skipped": stats.get("skipped", 0)},
+                   "details": stats.get("details", [])[:20]}  # limite taille
+        msg = json.dumps(msg_obj, ensure_ascii=False)[:1000]
+
         s.execute(
             sqltext("""
                 UPDATE job_runs
@@ -240,7 +271,7 @@ def main():
                 "ins": int(stats.get("inserted", 0)),
                 "skp": int(stats.get("skipped", 0)),
                 "fld": int(stats.get("failed", 0)),
-                "msg": str(stats)[:1000],
+                "msg": msg,
                 "id": run_id
             }
         )
@@ -251,9 +282,12 @@ def main():
     finally:
         s.close()
 
+    if args.verbose:
+        for d in stats.get("details", []):
+            print("SKIP DETAIL:", d)
+
     print(("OK" if ok else "ERROR"), stats)
     sys.exit(0 if ok else 1)
-
 
 if __name__ == "__main__":
     main()
