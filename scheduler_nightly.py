@@ -1,7 +1,8 @@
 # scheduler_nightly.py
 import os, sys, uuid, calendar, argparse
 from datetime import date, datetime, timedelta
-from sqlalchemy import create_engine, and_, func, text
+from sqlalchemy import create_engine, and_, func
+from sqlalchemy import text as sqltext
 from sqlalchemy.orm import sessionmaker
 from models import Asset, AssetLivret, AssetImmo, ImmoLoan, AssetEvent  # réutilise tes models
 from zoneinfo import ZoneInfo
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 DB_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
 Session = sessionmaker(bind=engine)
+JOB_NAME = "auto-events"
 
 TZ = ZoneInfo("Europe/Paris")
 
@@ -200,10 +202,9 @@ def main():
 
     # 1) ouvrir un run "running" AVANT le traitement
     s = Session()
-    run_id = None
     try:
         run_id = s.execute(
-            text("""
+            sqltext("""
                 INSERT INTO job_runs (job_name, run_date, started_at, state)
                 VALUES (:name, :run_date, now(), 'running')
                 RETURNING id
@@ -211,20 +212,18 @@ def main():
             {"name": JOB_NAME, "run_date": today}
         ).scalar_one()
         s.commit()
-    except Exception:
+    except:
         s.rollback()
         raise
     finally:
         s.close()
 
-    # 2) exécuter le job
     ok, stats = run_for_day(today)
 
-    # 3) clôturer le run avec le résultat
     s = Session()
     try:
         s.execute(
-            text("""
+            sqltext("""
                 UPDATE job_runs
                 SET finished_at = now(),
                     state        = :state,
@@ -241,12 +240,12 @@ def main():
                 "ins": int(stats.get("inserted", 0)),
                 "skp": int(stats.get("skipped", 0)),
                 "fld": int(stats.get("failed", 0)),
-                "msg": str(stats)[:1000],  # petit résumé
+                "msg": str(stats)[:1000],
                 "id": run_id
             }
         )
         s.commit()
-    except Exception:
+    except:
         s.rollback()
         raise
     finally:
