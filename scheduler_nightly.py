@@ -1,7 +1,7 @@
 # scheduler_nightly.py
 import os, sys, uuid, calendar, argparse
 from datetime import date, datetime, timedelta
-from sqlalchemy import create_engine, and_, func
+from sqlalchemy import create_engine, and_, func, text
 from sqlalchemy.orm import sessionmaker
 from models import Asset, AssetLivret, AssetImmo, ImmoLoan, AssetEvent  # réutilise tes models
 from zoneinfo import ZoneInfo
@@ -198,23 +198,63 @@ def main():
 
     today = datetime.now(TZ).date() if not args.date else date.fromisoformat(args.date)
 
+    # 1) ouvrir un run "running" AVANT le traitement
+    s = Session()
+    run_id = None
+    try:
+        run_id = s.execute(
+            text("""
+                INSERT INTO job_runs (job_name, run_date, started_at, state)
+                VALUES (:name, :run_date, now(), 'running')
+                RETURNING id
+            """),
+            {"name": JOB_NAME, "run_date": today}
+        ).scalar_one()
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+    # 2) exécuter le job
     ok, stats = run_for_day(today)
 
-    # Log dans job_runs
+    # 3) clôturer le run avec le résultat
     s = Session()
     try:
         s.execute(
-            "INSERT INTO job_runs (job_name, ok, inserted_events, skipped_events, details, finished_at) "
-            "VALUES (:job, :ok, :ins, :skip, cast(:det as jsonb), now())",
-            {"job":"nightly_scheduler", "ok":ok, "ins":stats.get("inserted",0),
-             "skip":stats.get("skipped",0), "det":str(stats)}
+            text("""
+                UPDATE job_runs
+                SET finished_at = now(),
+                    state        = :state,
+                    ok           = :ok,
+                    items_inserted = :ins,
+                    items_skipped  = :skp,
+                    items_failed   = :fld,
+                    message        = :msg
+                WHERE id = :id
+            """),
+            {
+                "state": "done" if ok else "error",
+                "ok": bool(ok),
+                "ins": int(stats.get("inserted", 0)),
+                "skp": int(stats.get("skipped", 0)),
+                "fld": int(stats.get("failed", 0)),
+                "msg": str(stats)[:1000],  # petit résumé
+                "id": run_id
+            }
         )
         s.commit()
+    except Exception:
+        s.rollback()
+        raise
     finally:
         s.close()
 
     print(("OK" if ok else "ERROR"), stats)
     sys.exit(0 if ok else 1)
+
 
 if __name__ == "__main__":
     main()
