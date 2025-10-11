@@ -2483,6 +2483,510 @@ def delete_event(event_id):
     finally:
         session.close()
 
+from math import isfinite
+
+def _first_of_month(d: datetime.date) -> datetime.date:
+    return datetime(d.year, d.month, 1).date()
+
+def _add_months(d: datetime.date, k: int) -> datetime.date:
+    y = d.year + (d.month - 1 + k) // 12
+    m = ((d.month - 1 + k) % 12) + 1
+    return datetime(y, m, 1).date()
+
+def _months_between(a: datetime.date, b: datetime.date) -> int:
+    # nombre de mois entiers (b - a) en prenant 1er du mois
+    a1, b1 = _first_of_month(a), _first_of_month(b)
+    return (b1.year - a1.year) * 12 + (b1.month - a1.month)
+
+def _freq_to_monthly(freq: str | None) -> float:
+    if not freq:
+        return 0.0
+    f = str(freq).strip().lower()
+    if f in ("mensuel", "monthly"):
+        return 1.0
+    if f in ("trimestriel", "quarterly"):
+        return 1.0 / 3.0
+    if f in ("annuel", "annual", "yearly"):
+        return 1.0 / 12.0
+    return 0.0
+
+def _apy_to_monthly(apy: float) -> float:
+    try:
+        return (1.0 + float(apy)) ** (1.0 / 12.0) - 1.0
+    except Exception:
+        return 0.0
+
+def _safe_float(x, default=0.0):
+    v = parse_float(x)
+    return v if (v is not None and isfinite(v)) else default
+
+def _loan_monthly_payment(P: float, r_apy: float, n_months: int) -> float:
+    """Renvoie mensualité (hors assurance). Utilise utils.amortization_monthly_payment si possible."""
+    if P is None or n_months is None or n_months <= 0:
+        return 0.0
+    try:
+        if r_apy is None:
+            return amortization_monthly_payment(P, 0.0, n_months)
+        return amortization_monthly_payment(P, r_apy, n_months)
+    except Exception:
+        r = (r_apy or 0.0) / 12.0
+        if abs(r) < 1e-9:
+            return P / max(n_months, 1)
+        return P * (r * (1 + r) ** n_months) / ((1 + r) ** n_months - 1)
+
+@app.route("/api/projection", methods=["GET", "POST"])
+@jwt_required()
+def projection():
+    """
+    Projection multi-modules (patrimoine net empilé + cashflows + jalons + snapshot)
+    Query/body params (tous optionnels):
+      - start (YYYY-MM-DD, défaut = 1er jour du mois courant UTC)
+      - months (int, défaut 120)
+      - scenario = base | doux | soft | choc | shock (défaut base)
+      - dca_mult (float, défaut 1.0)
+      - portfolio_apy, livret_apy, immo_app_apy, inflation_apy (floats, ex: 0.06)
+      - vacancy (float, ex: 0.06)
+      - snapshot_at (YYYY-MM-DD) -> date pour le donut (défaut = dernier mois projeté)
+    """
+    uid = int(get_jwt_identity())
+
+    # --- lecture params (GET ou JSON) ---
+    if request.method == "GET":
+        q = request.args
+        body = {}
+    else:
+        body = request.get_json(silent=True) or {}
+        q = request.args
+
+    start = parse_date(q.get("start") or body.get("start")) or _first_of_month(datetime.utcnow().date())
+    months = int(q.get("months") or body.get("months") or 120)
+    scenario = (q.get("scenario") or body.get("scenario") or "base").strip().lower()
+    dca_mult = _safe_float(q.get("dca_mult") or body.get("dca_mult") or 1.0, 1.0)
+
+    # presets
+    SCEN = {
+        "base": {"portfolio_apy": 0.06, "livret_apy": 0.03, "immo_app_apy": 0.015, "inflation_apy": 0.02, "vacancy": 0.06},
+        "doux": {"portfolio_apy": 0.04, "livret_apy": 0.025, "immo_app_apy": 0.01,  "inflation_apy": 0.02, "vacancy": 0.08},
+        "soft": {"portfolio_apy": 0.04, "livret_apy": 0.025, "immo_app_apy": 0.01,  "inflation_apy": 0.02, "vacancy": 0.08},
+        "choc": {"portfolio_apy": -0.02, "livret_apy": 0.02, "immo_app_apy": -0.005,"inflation_apy": 0.03, "vacancy": 0.12},
+        "shock":{"portfolio_apy": -0.02, "livret_apy": 0.02, "immo_app_apy": -0.005,"inflation_apy": 0.03, "vacancy": 0.12},
+    }
+    base_rates = SCEN.get(scenario, SCEN["base"])
+
+    # overrides
+    portfolio_apy = _safe_float(q.get("portfolio_apy") or body.get("portfolio_apy") or base_rates["portfolio_apy"], base_rates["portfolio_apy"])
+    livret_apy    = _safe_float(q.get("livret_apy")    or body.get("livret_apy")    or base_rates["livret_apy"],    base_rates["livret_apy"])
+    immo_app_apy  = _safe_float(q.get("immo_app_apy")  or body.get("immo_app_apy")  or base_rates["immo_app_apy"],  base_rates["immo_app_apy"])
+    inflation_apy = _safe_float(q.get("inflation_apy") or body.get("inflation_apy") or base_rates["inflation_apy"], base_rates["inflation_apy"])
+    vacancy       = _safe_float(q.get("vacancy")       or body.get("vacancy")       or base_rates["vacancy"],       base_rates["vacancy"])
+
+    snapshot_at   = parse_date(q.get("snapshot_at") or body.get("snapshot_at"))
+
+    # monthly rates
+    r_pf_m   = _apy_to_monthly(portfolio_apy)
+    r_lv_m   = _apy_to_monthly(livret_apy)
+    r_immo_m = _apy_to_monthly(immo_app_apy)
+    r_cpi_m  = _apy_to_monthly(inflation_apy)
+
+    s = Session()
+    try:
+        # charge data
+        assets = (s.query(Asset)
+                    .filter(Asset.user_id == uid)
+                    .options(
+                        joinedload(Asset.livret),
+                        joinedload(Asset.other),
+                        joinedload(Asset.portfolio).joinedload(AssetPortfolio.lines),
+                        joinedload(Asset.portfolio).joinedload(AssetPortfolio.products),
+                        joinedload(Asset.immo).joinedload(AssetImmo.loans),
+                        joinedload(Asset.immo).joinedload(AssetImmo.expenses),
+                    ).all())
+
+        incomes = s.query(UserIncome).filter(UserIncome.user_id == uid).all()
+        try:
+            expenses = s.query(UserExpense).filter(UserExpense.user_id == uid).all()
+        except Exception:
+            expenses = []  # si le modèle n'existe pas encore
+
+        # ---------- init états par type ----------
+        # Livrets
+        livret_states = []  # [{label, value, bene_id, contrib_m}]
+        # Portfolios
+        pf_states = []      # [{label, value, bene_id, contrib_m, envelopes:[str]}]
+        # Immo
+        immo_states = []    # [{label, bene_id, prop_value, loans:[{remain, r_m, pay_no_ins, months_left, end_date}], insurance_m, rent_m, expenses_m, ownership_pct}]
+        # Others
+        other_states = []   # [{label, value, bene_id}]
+
+        for a in assets:
+            bene_id = a.beneficiary_id
+            if a.type == "livret" and a.livret:
+                lv = a.livret
+                value0 = _safe_float(getattr(lv, "balance_effective", None), None)
+                if value0 is None:
+                    value0 = _safe_float(lv.balance, _safe_float(a.current_value))
+                contrib_m = _safe_float(lv.recurring_amount) * _freq_to_monthly(lv.recurring_frequency)
+                livret_states.append({
+                    "label": a.label, "value": max(value0, 0.0), "bene_id": bene_id,
+                    "contrib_m": max(contrib_m, 0.0)
+                })
+
+            elif a.type == "portfolio" and a.portfolio:
+                pf = a.portfolio
+                value0 = _safe_float(a.current_value, 0.0)
+                # DCA par lignes si dispo, sinon fallback au recurring du portefeuille
+                dca_total = 0.0
+                for ln in pf.lines or []:
+                    dca_total += _safe_float(ln.amount_allocated) * _freq_to_monthly(ln.allocation_frequency)
+                if dca_total <= 0 and pf.recurring_frequency:
+                    dca_total = _safe_float(pf.recurring_amount) * _freq_to_monthly(pf.recurring_frequency)
+
+                envelopes = [p.product_type for p in (pf.products or []) if p.product_type]
+                pf_states.append({
+                    "label": a.label, "value": max(value0, 0.0), "bene_id": bene_id,
+                    "contrib_m": max(dca_total * dca_mult, 0.0),
+                    "envelopes": envelopes or []
+                })
+
+            elif a.type == "immo" and a.immo:
+                im = a.immo
+                prop0 = _safe_float(im.last_estimation_value, _safe_float(im.purchase_price))
+                insurance_m = _safe_float(im.insurance_monthly, 0.0)
+
+                # loyer: direct si renseigné, sinon 0 (l’association UserIncome éventuelle est ignorée ici)
+                rent_m = _safe_float(im.rental_income, 0.0)
+
+                # dépenses immo récurrentes (mensualisées)
+                expenses_m = 0.0
+                for ex in im.expenses or []:
+                    expenses_m += _safe_float(ex.amount) * _freq_to_monthly(ex.frequency)
+
+                # prêts
+                loans = []
+                for ln in im.loans or []:
+                    P = _safe_float(ln.loan_amount, 0.0)
+                    r_apy = _safe_float(ln.loan_rate, 0.0) / 100.0 if ln.loan_rate and ln.loan_rate > 1 else _safe_float(ln.loan_rate, 0.0)
+                    r_m = (r_apy) / 12.0
+                    n = ln.loan_duration_months or 0
+                    pay = _safe_float(ln.monthly_payment, None)
+                    if not pay:
+                        pay = _loan_monthly_payment(P, r_apy, n)
+
+                    # capital restant dû à la date 'start'
+                    k_elapsed = 0
+                    if ln.loan_start_date:
+                        try:
+                            k_elapsed = max(0, _months_between(ln.loan_start_date, start))
+                        except Exception:
+                            k_elapsed = 0
+                    remain = float(P)
+                    # avance jusqu'à 'start'
+                    for _ in range(min(k_elapsed, max(n, 0))):
+                        if remain <= 1e-8:
+                            remain = 0.0
+                            break
+                        interest = remain * r_m
+                        principal = max(0.0, pay - interest)
+                        principal = min(principal, remain)
+                        remain -= principal
+
+                    months_left = max(0, n - k_elapsed)
+                    end_date = _add_months(ln.loan_start_date or start, months_left)
+                    loans.append({
+                        "remain": max(remain, 0.0), "r_m": r_m, "pay_no_ins": pay,
+                        "months_left": months_left, "end_date": end_date
+                    })
+
+                immo_states.append({
+                    "label": a.label, "bene_id": bene_id,
+                    "prop_value": max(prop0, 0.0),
+                    "loans": loans,
+                    "insurance_m": insurance_m,
+                    "rent_m": max(rent_m, 0.0),
+                    "expenses_m": max(expenses_m, 0.0),
+                    "ownership_pct": _safe_float(im.ownership_percentage, 100.0)
+                })
+
+            elif a.type == "other" and a.other:
+                oth = a.other
+                value0 = _safe_float(oth.estimated_value, _safe_float(a.current_value))
+                other_states.append({"label": a.label, "value": max(value0, 0.0), "bene_id": bene_id})
+
+            else:
+                # si 'current_value' existe quand même
+                v0 = _safe_float(a.current_value, 0.0)
+                if v0 > 0:
+                    other_states.append({"label": a.label, "value": v0, "bene_id": bene_id})
+
+        # revenus (mensualisés), avec end_date
+        income_defs = []
+        for inc in incomes or []:
+            m = _safe_float(inc.amount) * _freq_to_monthly(inc.frequency)
+            income_defs.append({"amount_m": max(m, 0.0), "end": inc.end_date})
+
+        # dépenses utilisateur (mensualisées)
+        expense_defs = []
+        for ex in expenses or []:
+            m = _safe_float(ex.amount) * _freq_to_monthly(ex.frequency)
+            expense_defs.append({"amount_m": max(m, 0.0)})
+
+        # ---------- boucle mensuelle ----------
+        times = []
+        stack_livrets = []
+        stack_portfolios = []
+        stack_immo = []
+        stack_other = []
+        total_series = []
+
+        inflow_series = []
+        outflow_series = []
+        net_series = []
+        capacity_series = []
+
+        milestones = []
+
+        # pré-déclare les jalons fin de prêt
+        for im in immo_states:
+            for ln in im["loans"]:
+                if ln["months_left"] > 0:
+                    milestones.append({
+                        "date": ln["end_date"].isoformat(),
+                        "kind": "loan_end",
+                        "label": f"Fin prêt · {im['label']}",
+                        "amount": ln["pay_no_ins"]
+                    })
+
+        # états dynamiques (valeurs)
+        lv_vals = [st["value"] for st in livret_states]
+        pf_vals = [st["value"] for st in pf_states]
+        im_prop_vals = [st["prop_value"] for st in immo_states]
+        # loans remain sont déjà portés dans immo_states.loans
+
+        exp_cpi_factor = 1.0  # indexation dépenses
+        for i in range(months):
+            t = _add_months(start, i)
+            times.append(t.isoformat())
+
+            # --- inflows ---
+            inflows = 0.0
+            # revenus utilisateur actifs ce mois
+            for inc in income_defs:
+                if inc["end"] and t > inc["end"]:
+                    continue
+                inflows += inc["amount_m"]
+            # loyers (affectés par vacance)
+            rents = 0.0
+            for idx, im in enumerate(immo_states):
+                r = im["rent_m"] * max(0.0, 1.0 - vacancy)
+                rents += r
+            inflows += rents
+
+            # --- outflows (charges hors épargne) ---
+            # prêts immo + assurance + dépenses immo indexées CPI + dépenses user indexées CPI
+            charges_hors_epargne = 0.0
+            # prêts
+            for im_idx, im in enumerate(immo_states):
+                # dépense fixe: assurance
+                charges_hors_epargne += im["insurance_m"] if im["insurance_m"] else 0.0
+
+                # dépenses immo (CPI)
+                charges_hors_epargne += (im["expenses_m"] * exp_cpi_factor) if im["expenses_m"] else 0.0
+
+                # prêts: somme des mensualités (hors assurance) si reste du capital
+                for ln in im["loans"]:
+                    if ln["remain"] > 1e-8 and ln["months_left"] > 0:
+                        charges_hors_epargne += ln["pay_no_ins"]
+
+            # dépenses user (CPI)
+            for ex in expense_defs:
+                charges_hors_epargne += ex["amount_m"] * exp_cpi_factor
+
+            # --- contributions épargne (outflows d’épargne) ---
+            contrib_livrets = sum(st["contrib_m"] for st in livret_states)
+            contrib_pfs     = sum(st["contrib_m"] for st in pf_states)
+            outflows_epargne = contrib_livrets + contrib_pfs
+
+            outflows_total = charges_hors_epargne + outflows_epargne
+            net_cf = inflows - outflows_total
+            capacity = inflows - charges_hors_epargne  # capacité d’épargne
+
+            # --- mise à jour valeurs (capitalisation + DCA) ---
+            # Livrets
+            for j, st in enumerate(livret_states):
+                val = lv_vals[j]
+                val = val * (1.0 + r_lv_m) + st["contrib_m"]  # simple: intérêts mensuels + versement
+                lv_vals[j] = max(val, 0.0)
+
+            # Portfolios
+            for j, st in enumerate(pf_states):
+                val = pf_vals[j]
+                val = val * (1.0 + r_pf_m) + st["contrib_m"]
+                pf_vals[j] = max(val, 0.0)
+
+            # Immobilier: valeur + amortissement du capital
+            for j, im in enumerate(immo_states):
+                # valeur du bien
+                pv = im_prop_vals[j] * (1.0 + r_immo_m)
+                im_prop_vals[j] = max(pv, 0.0)
+                # prêts -> mise à jour capital restant dû
+                for ln in im["loans"]:
+                    if ln["remain"] > 1e-8 and ln["months_left"] > 0:
+                        interest = ln["remain"] * ln["r_m"]
+                        principal = max(0.0, ln["pay_no_ins"] - interest)
+                        principal = min(principal, ln["remain"])
+                        ln["remain"] -= principal
+                        ln["months_left"] -= 1
+
+            # Other: inchangés (pas de capitalisation par défaut)
+
+            # --- séries empilées ---
+            tot_livret = sum(lv_vals) if lv_vals else 0.0
+            tot_pf     = sum(pf_vals) if pf_vals else 0.0
+            # immo equity = prop_value - somme capital restant dû
+            tot_immo_equity = 0.0
+            for j, im in enumerate(immo_states):
+                remain = sum(ln["remain"] for ln in im["loans"])
+                eq = max(im_prop_vals[j] - remain, 0.0)
+                tot_immo_equity += eq
+
+            tot_other = sum(st["value"] for st in other_states) if other_states else 0.0
+            total = tot_livret + tot_pf + tot_immo_equity + tot_other
+
+            stack_livrets.append(tot_livret)
+            stack_portfolios.append(tot_pf)
+            stack_immo.append(tot_immo_equity)
+            stack_other.append(tot_other)
+            total_series.append(total)
+
+            inflow_series.append(inflows)
+            outflow_series.append(outflows_total)
+            net_series.append(net_cf)
+            capacity_series.append(capacity)
+
+            # indexation dépenses (CPI) pour le mois suivant
+            exp_cpi_factor *= (1.0 + r_cpi_m)
+
+        # ---------- snapshot donut ----------
+        snap_date = snapshot_at or (times[-1] if times else _first_of_month(datetime.utcnow().date()).isoformat())
+        # on prend le dernier état calculé pour répartitions
+        last_lv = stack_livrets[-1] if stack_livrets else 0.0
+        last_pf = stack_portfolios[-1] if stack_portfolios else 0.0
+        last_im = stack_immo[-1] if stack_immo else 0.0
+        last_ot = stack_other[-1] if stack_other else 0.0
+
+        # by type
+        donut_by_type = [
+            {"label": "Immobilier (equity)", "value": round(last_im, 2)},
+            {"label": "Portefeuilles",       "value": round(last_pf, 2)},
+            {"label": "Livrets",             "value": round(last_lv, 2)},
+            {"label": "Autres",              "value": round(last_ot, 2)},
+        ]
+
+        # by beneficiary (approx: on répartit chaque catégorie par somme des parts initiales)
+        bene_totals = {}
+        # livret
+        lv_sum_init = sum(st["value"] for st in livret_states) or 1.0
+        if lv_sum_init > 0:
+            for st in livret_states:
+                part = (st["value"] / lv_sum_init) * last_lv
+                bene_totals[st["bene_id"]] = bene_totals.get(st["bene_id"], 0.0) + part
+        # pf
+        pf_sum_init = sum(st["value"] for st in pf_states) or 1.0
+        if pf_sum_init > 0:
+            for st in pf_states:
+                part = (st["value"] / pf_sum_init) * last_pf
+                bene_totals[st["bene_id"]] = bene_totals.get(st["bene_id"], 0.0) + part
+        # immo (au pro rata equity courant : on approx par ownership_pct initial)
+        if immo_states and last_im > 0:
+            # calc equity courant par immeuble
+            im_equities = []
+            for j, im in enumerate(immo_states):
+                remain = sum(ln["remain"] for ln in im["loans"])
+                eq = max(im_prop_vals[j] - remain, 0.0)
+                im_equities.append(eq)
+            im_sum_eq = sum(im_equities) or 1.0
+            for j, im in enumerate(immo_states):
+                bene = im["bene_id"]
+                # ownership_pct si présent, sinon 100% sur le bénéficiaire actuel
+                fr = (im["ownership_pct"] or 100.0) / 100.0
+                part = (im_equities[j] / im_sum_eq) * last_im * fr
+                bene_totals[bene] = bene_totals.get(bene, 0.0) + part
+        # other
+        ot_sum_init = sum(st["value"] for st in other_states) or 1.0
+        if ot_sum_init > 0:
+            for st in other_states:
+                part = (st["value"] / ot_sum_init) * last_ot
+                bene_totals[st["bene_id"]] = bene_totals.get(st["bene_id"], 0.0) + part
+
+        donut_by_beneficiary = [
+            {"beneficiary_id": k, "value": round(v, 2)} for k, v in bene_totals.items()
+        ]
+
+        # ---------- enveloppes (approx égale par produit déclaré au niveau du portefeuille) ----------
+        envelope_totals = {}
+        if last_pf > 0 and pf_states:
+            # pondération égale par portefeuille, puis par enveloppe de ce portefeuille
+            pf_total_now = last_pf or 1.0
+            # approximons par part initiale du portefeuille dans l'ensemble des portefeuilles
+            init_pf_sum = sum(st["value"] for st in pf_states) or 1.0
+            for st in pf_states:
+                st_share_now = (st["value"] / init_pf_sum) * last_pf
+                envs = st["envelopes"] or ["CTO"]
+                if envs:
+                    per_env = st_share_now / len(envs)
+                    for e in envs:
+                        envelope_totals[e] = envelope_totals.get(e, 0.0) + per_env
+
+        donut_by_envelope = [{"label": k, "value": round(v, 2)} for k, v in envelope_totals.items()]
+
+        # ---------- sortie ----------
+        return jsonify({
+            "ok": True,
+            "params": {
+                "start": start.isoformat(),
+                "months": months,
+                "scenario": scenario,
+                "rates_used": {
+                    "portfolio_apy": portfolio_apy,
+                    "livret_apy": livret_apy,
+                    "immo_app_apy": immo_app_apy,
+                    "inflation_apy": inflation_apy,
+                    "vacancy": vacancy,
+                    "dca_mult": dca_mult
+                }
+            },
+            "times": times,
+            "net_worth": {
+                "total": [round(x, 2) for x in total_series],
+                "stack": {
+                    "livrets": [round(x, 2) for x in stack_livrets],
+                    "portfolios": [round(x, 2) for x in stack_portfolios],
+                    "immo_equity": [round(x, 2) for x in stack_immo],
+                    "other": [round(x, 2) for x in stack_other],
+                }
+            },
+            "cashflow": {
+                "inflows": [round(x, 2) for x in inflow_series],
+                "outflows": [round(x, 2) for x in outflow_series],
+                "net": [round(x, 2) for x in net_series],
+                "capacity": [round(x, 2) for x in capacity_series],
+            },
+            "snapshot": {
+                "at": (snapshot_at or parse_date(times[-1]) or start).isoformat(),
+                "donut": {
+                    "by_type": donut_by_type,
+                    "by_beneficiary": donut_by_beneficiary,
+                    "by_envelope": donut_by_envelope,
+                }
+            },
+            "milestones": milestones
+        }), 200
+
+    except Exception as e:
+        app.logger.exception("❌ /api/projection failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        s.close()
 
 from auth_google import register_google_auth_route
 register_google_auth_route(app, app.config["JWT_SECRET_KEY"], engine)
