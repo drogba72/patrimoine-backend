@@ -10,7 +10,7 @@ from models import (
     AssetOther, UserIncome, UserExpense, PortfolioProduct, ImmoLoan, ImmoExpense,
     ProduitInvest, ProduitHisto, ProduitIndicateurs, ProduitIntraday, BrokerLink, AssetEvent, # ✅ ajout
 )
-
+from werkzeug.exceptions import HTTPException
 import re
 from utils import amortization_monthly_payment
 from datetime import datetime, timedelta
@@ -36,7 +36,6 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)  # affiche sur stdout -> Render
     ]
 )
-
 
 # Charger variables d’environnement
 load_dotenv()
@@ -88,6 +87,33 @@ try:
     _fernet = Fernet(_key.encode())  # ✅ toujours bytes
 except Exception as e:
     raise RuntimeError("BROKER_CRYPT_KEY must be a 32-byte urlsafe base64 key") from e
+
+@app.errorhandler(HTTPException)
+def handle_http_exc(e):
+    # Toutes les erreurs HTTP (404, 405, 415, etc.) en JSON
+    return jsonify(ok=False, error=e.name, description=e.description, code=e.code), e.code
+
+@app.errorhandler(Exception)
+def handle_unhandled_exc(e):
+    app.logger.exception("Unhandled exception")
+    return jsonify(ok=False, error=str(e)), 500
+
+@jwt.unauthorized_loader
+def jwt_unauthorized(msg):
+    return jsonify(ok=False, error=msg), 401
+
+@jwt.invalid_token_loader
+def jwt_invalid(msg):
+    return jsonify(ok=False, error=msg), 422
+
+@jwt.expired_token_loader
+def jwt_expired(jwt_header, jwt_payload):
+    return jsonify(ok=False, error="Token expiré"), 401
+
+@app.get("/healthz")
+def healthz():
+    return jsonify(ok=True)
+
 
 def parse_date(val):
     """
