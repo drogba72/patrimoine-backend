@@ -3,14 +3,15 @@ import os, sys, uuid, calendar, argparse
 from datetime import date, datetime, timedelta
 from sqlalchemy import create_engine, and_, func
 from sqlalchemy import text as sqltext
+from sqlalchemy.pool import NullPool
 from sqlalchemy.orm import sessionmaker
 from models import Asset, AssetLivret, AssetImmo, ImmoLoan, AssetEvent  # réutilise tes models
 from zoneinfo import ZoneInfo
 import json
 
 DB_URL = os.environ["DATABASE_URL"]
-engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
-Session = sessionmaker(bind=engine)
+engine = create_engine(DB_URL, future=True, poolclass=NullPool)
+Session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 JOB_NAME = "auto-events"
 
 TZ = ZoneInfo("Europe/Paris")

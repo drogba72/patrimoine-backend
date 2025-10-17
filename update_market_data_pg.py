@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 from dotenv import load_dotenv
 from justetf_scraping import overview
 
@@ -83,7 +84,7 @@ def main():
     print(df_meta.head(), "\n")
 
     # Connexion SQLAlchemy
-    engine = create_engine(DB_URL)
+    engine = create_engine(DB_URL, poolclass=NullPool)
 
     with engine.begin() as conn:
         for _, row in df_invest.iterrows():

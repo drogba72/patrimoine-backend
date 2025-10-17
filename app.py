@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, joinedload
+from sqlalchemy.pool import NullPool  # ✅ AJOUT
 import os
 from dotenv import load_dotenv
 from models import (
@@ -17,7 +18,7 @@ from datetime import datetime, timedelta
 import traceback
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, OperationalError
 import json
 from sqlalchemy import and_, func
 from scraper_tr import connect as tr_connect_api, validate_2fa as tr_validate_api, fetch_data as tr_fetch_api
@@ -44,9 +45,19 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL required in env")
 
 # Config DB
-engine = create_engine(DATABASE_URL, echo=False, future=True, pool_pre_ping=True)  # ✅
+engine = create_engine(
+    DATABASE_URL,
+    future=True,
+    poolclass=NullPool,  # ✅ Aucune connexion gardée entre requêtes
+    connect_args={
+        # ✅ évite les transactions pendantes qui "réveillent" la DB inutilement
+        "options": "-c statement_timeout=5000 -c idle_in_transaction_session_timeout=1000"
+    }
+)
 
-Session = sessionmaker(bind=engine)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+# ✅ alias pour conserver ton code existant qui fait Session()
+Session = SessionLocal
 
 # App Flask
 app = Flask(__name__)
@@ -97,6 +108,11 @@ def handle_http_exc(e):
 def handle_unhandled_exc(e):
     app.logger.exception("Unhandled exception")
     return jsonify(ok=False, error=str(e)), 500
+
+@app.errorhandler(OperationalError)
+def db_unavailable(e):
+    return jsonify(ok=False, error="database_unavailable",
+                   message="Base indisponible (quota/veille). Réessaie bientôt."), 503
 
 @jwt.unauthorized_loader
 def jwt_unauthorized(msg):
@@ -1005,14 +1021,13 @@ def register():
         session.add(user)
         session.commit()
 
-        # register()
-        token = create_access_token(identity=str(user.id))  # ✅ au lieu de user.id
-
+        token = create_access_token(identity=str(user.id))  # JWT sub = str
         return jsonify({
             "ok": True,
             "token": token,
             "user": {"id": user.id, "email": user.email, "fullname": user.fullname}
         }), 201
+
     except SQLAlchemyError as e:
         session.rollback()
         return jsonify({"ok": False, "error": str(e)}), 500
